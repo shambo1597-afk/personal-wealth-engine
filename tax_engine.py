@@ -21,11 +21,40 @@ SEC_50AA_TAX_RATE         = SEC_50AA_BASE_RATE * (1.0 + HEALTH_AND_EDUCATION_CES
 SEC_112A_EXEMPTION_LIMIT  = 125000.0   # ₹1,25,000 Annual Tax-Free LTCG Exemption (Sec 112A)
 
 # ----------------------------------------------------------------------------------------------------
+# 1.1 SECTION 112A / SECTION 55(2)(ac) PRE-2018 GRANDFATHERING ENGINE
+# ----------------------------------------------------------------------------------------------------
+def compute_grandfathered_cost_basis(buy_date, buy_price, sale_or_live_price, fmv_31jan2018=None):
+    """
+    Computes the deemed cost of acquisition under Section 55(2)(ac) of the Income Tax Act, 1961:
+    For equity shares and equity-oriented mutual funds acquired before 1st February 2018 (buy_date < '2018-02-01'):
+      - Step 1: Lower of FMV on 31-Jan-2018 and Sale / Live Price = min(FMV_31Jan2018, Sale_Price)
+      - Step 2: Higher of Actual Buy Price and Step 1 value = max(Buy_Price, min(FMV_31Jan2018, Sale_Price))
+    If FMV on 31-Jan-2018 is not available, missing, or <= 0, falls back to actual buy_price.
+    For assets acquired on or after 1st February 2018, returns actual buy_price.
+    """
+    try:
+        if buy_date and pd.notna(buy_date):
+            b_str = str(buy_date).strip()
+            if len(b_str) >= 10:
+                b_date_prefix = b_str[:10]
+                if b_date_prefix < '2018-02-01':
+                    if fmv_31jan2018 is not None and pd.notna(fmv_31jan2018):
+                        fmv = float(fmv_31jan2018)
+                        if fmv > 0:
+                            p_buy = float(buy_price)
+                            p_sale = float(sale_or_live_price)
+                            return max(p_buy, min(fmv, p_sale))
+    except Exception:
+        pass
+    return float(buy_price)
+
+# ----------------------------------------------------------------------------------------------------
 # 2. REALIZED CAPITAL GAINS & SECTION 70/74 INTRA-HEAD SET-OFF ENGINE
 # ----------------------------------------------------------------------------------------------------
 def compute_realized_tax_summary(fy_sells_df):
     """
     Computes realized capital gains and enforces statutory Section 70 & 74 intra-head loss set-off rules:
+      - Applies Section 55(2)(ac) pre-2018 grandfathering for eligible Section 112A LTCG trades.
       - Combines equity STCL and Section 50AA Debt STCL under Section 70(2).
       - Prioritizes setting off STCL against Section 50AA Debt STCG first (highest slab rate drag).
       - Sets off STCL against Section 111A Equity STCG.
@@ -67,7 +96,20 @@ def compute_realized_tax_summary(fy_sells_df):
         (~fy_sells_df['gain_type'].str.contains('50AA', na=False))
     ]
 
-    gross_112a_pnl = float(ltcg_trades['realized_pnl'].sum()) if not ltcg_trades.empty else 0.0
+    ltcg_pnls = []
+    for _, row in ltcg_trades.iterrows():
+        pnl = float(row['realized_pnl'])
+        b_date = row.get('buy_date')
+        if b_date and pd.notna(b_date) and str(b_date).strip()[:10] < '2018-02-01':
+            q = float(row['quantity'])
+            p_sale = float(row['price'])
+            fmv = row.get('fmv_31jan2018', row.get('fmv', None))
+            p_buy = float(row['buy_price']) if ('buy_price' in row and pd.notna(row['buy_price'])) else ((q * p_sale - pnl) / q if q > 0 else 0.0)
+            deemed_cost = compute_grandfathered_cost_basis(b_date, p_buy, p_sale, fmv)
+            pnl = round((p_sale - deemed_cost) * q, 2)
+        ltcg_pnls.append(pnl)
+
+    gross_112a_pnl = float(sum(ltcg_pnls)) if ltcg_pnls else 0.0
     gross_111a_pnl = float(stcg_trades['realized_pnl'].sum()) if not stcg_trades.empty else 0.0
     net_50aa_stcg  = float(debt_50aa_trades['realized_pnl'].sum()) if not debt_50aa_trades.empty else 0.0
 
@@ -164,6 +206,7 @@ def compute_unrealized_tax_lots_analysis(tax_lots_df, latest_prices_series, curr
     Analyzes active tax lots to identify:
       1. Qualified Section 112A LTCG profits (Equity/Gold holding period >= 365 days, unrealized gain > 0).
          Strictly excludes Section 50AA Debt ETFs from LTCG exemption.
+         Applies Section 55(2)(ac) grandfathering for pre-2018 lots.
       2. Harvestable capital losses categorized into STCG, LTCG, and Section 50AA debt losses.
     Supports fractional and decimal lot quantities.
     """
@@ -209,10 +252,14 @@ def compute_unrealized_tax_lots_analysis(tax_lots_df, latest_prices_series, curr
         buy_dt = buy_raw.tz_localize(None) if getattr(buy_raw, 'tzinfo', None) is not None else buy_raw
         days_held = (today - buy_dt).days
 
+        # Apply Section 55(2)(ac) grandfathering for pre-2018 tax lots
+        fmv_val = lot.get('fmv_31jan2018', lot.get('fmv', None))
+        cost_basis = compute_grandfathered_cost_basis(lot.get('buy_date'), p_buy, p_live, fmv_val)
+
         # 1. Qualified LTCG Profit Check (Strictly Equity / Non-50AA Assets)
         # Under Section 50AA, Debt ETFs are deemed STCG forever and CANNOT enter harvest_rows
-        if not is_50aa_debt and days_held >= 365 and p_live > p_buy and p_live > 0:
-            profit = (p_live - p_buy) * q
+        if not is_50aa_debt and days_held >= 365 and p_live > cost_basis and p_live > 0:
+            profit = (p_live - cost_basis) * q
             total_harvestable_profit += profit
             harvest_rows.append({
                 'Ticker': t.replace('.NS', ''),
@@ -220,14 +267,14 @@ def compute_unrealized_tax_lots_analysis(tax_lots_df, latest_prices_series, curr
                 'Buy Date': lot['buy_date'],
                 'Days Held': days_held,
                 'Quantity': q_disp,
-                'Buy Price (₹)': np.round(p_buy, 2),
+                'Buy Price (₹)': np.round(cost_basis, 2),
                 'Live Price (₹)': np.round(p_live, 2),
                 'Unrealized LTCG Profit (₹)': np.round(profit, 2)
             })
 
         # 2. Tax-Loss Harvesting Check
-        if p_live < p_buy and p_live > 0:
-            loss_amount = (p_buy - p_live) * q
+        if p_live < cost_basis and p_live > 0:
+            loss_amount = (cost_basis - p_live) * q
             total_harvestable_losses += loss_amount
             loss_category = (
                 '🟡 Debt Loss (Sec 50AA)' if is_50aa_debt 
@@ -240,7 +287,7 @@ def compute_unrealized_tax_lots_analysis(tax_lots_df, latest_prices_series, curr
                 'Days Held': days_held,
                 'Loss Category': loss_category,
                 'Quantity': q_disp,
-                'Buy Price (₹)': np.round(p_buy, 2),
+                'Buy Price (₹)': np.round(cost_basis, 2),
                 'Live Price (₹)': np.round(p_live, 2),
                 'Unrealized Loss (₹)': np.round(loss_amount, 2)
             })
@@ -259,6 +306,7 @@ def build_schedule_112a_records(filtered_sells):
     """
     Formats sell trade ledger records into ITR-2 / ITR-3 Schedule 112A / Schedule CG tax audit structure.
     Enforces Section 48 non-deductibility of Securities Transaction Tax (STT).
+    Applies Section 55(2)(ac) pre-2018 grandfathered cost basis when applicable.
     Supports fractional and decimal lot quantities.
     """
     if filtered_sells is None or filtered_sells.empty:
@@ -277,6 +325,14 @@ def build_schedule_112a_records(filtered_sells):
         tot_sale = q * p_sale
         tot_cost = tot_sale - pnl
         cost_per_share = tot_cost / q if q > 0 else 0.0
+
+        b_date = row.get('buy_date')
+        if b_date and pd.notna(b_date) and str(b_date).strip()[:10] < '2018-02-01' and g_type == 'LTCG':
+            fmv = row.get('fmv_31jan2018', row.get('fmv', None))
+            actual_buy_price = float(row['buy_price']) if ('buy_price' in row and pd.notna(row['buy_price'])) else cost_per_share
+            cost_per_share = compute_grandfathered_cost_basis(b_date, actual_buy_price, p_sale, fmv)
+            tot_cost = q * cost_per_share
+            pnl = tot_sale - tot_cost
 
         if g_type == 'LTCG':
             sec = 'Section 112A (LTCG)'

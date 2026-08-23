@@ -319,12 +319,12 @@ with get_db_connection() as conn:
 owned_summary = {}
 for t in tax_lots_df['ticker'].unique():
     sub_lots = tax_lots_df[tax_lots_df['ticker'] == t]
-    total_q = int(sub_lots['quantity'].sum())
-    ltcg_q = 0
+    total_q = float(sub_lots['quantity'].sum())
+    ltcg_q = 0.0
     for _, lot in sub_lots.iterrows():
         lot_buy_dt = pd.to_datetime(lot['buy_date']).tz_localize(None) if getattr(pd.to_datetime(lot['buy_date']), 'tzinfo', None) is not None else pd.to_datetime(lot['buy_date'])
         if (today_naive - lot_buy_dt).days >= 365:
-            ltcg_q += int(lot['quantity'])
+            ltcg_q += float(lot['quantity'])
     
     a_class = str(sub_lots['asset_class'].iloc[0])
     if t == SOVEREIGN_BOND_TICKER:

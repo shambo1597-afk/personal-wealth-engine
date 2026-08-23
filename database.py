@@ -191,8 +191,12 @@ def clean_tax_lots_df(df):
     
     def parse_qty(x):
         if isinstance(x, bytes):
-            try: return float(int.from_bytes(x, byteorder='little'))
-            except Exception: return 0.0
+            try:
+                import struct
+                return round(float(struct.unpack('<d', x)[0]), 4)
+            except Exception:
+                try: return float(int.from_bytes(x, byteorder='little'))
+                except Exception: return 0.0
         try: return round(float(x), 4)
         except Exception: return 0.0
 
@@ -208,6 +212,8 @@ def clean_tax_lots_df(df):
         df['last_split_date'] = ''
     else:
         df['last_split_date'] = df['last_split_date'].fillna('').astype(str)
+    if 'fmv_31jan2018' in df.columns:
+        df['fmv_31jan2018'] = pd.to_numeric(df['fmv_31jan2018'], errors='coerce')
     return df
 
 def clean_trade_ledger_df(df):
@@ -221,6 +227,10 @@ def clean_trade_ledger_df(df):
     df['price'] = pd.to_numeric(df['price'], errors='coerce').fillna(0.0).apply(lambda v: round(float(v), 2))
     df['realized_pnl'] = pd.to_numeric(df['realized_pnl'], errors='coerce').fillna(0.0).apply(lambda v: round(float(v), 2))
     df['fees_estimated'] = pd.to_numeric(df['fees_estimated'], errors='coerce').fillna(0.0).apply(lambda v: round(float(v), 2))
+    if 'fmv_31jan2018' in df.columns:
+        df['fmv_31jan2018'] = pd.to_numeric(df['fmv_31jan2018'], errors='coerce')
+    if 'buy_date' in df.columns:
+        df['buy_date'] = df['buy_date'].fillna('').astype(str)
     return df
 
 # ----------------------------------------------------------------------------------------------------
@@ -280,8 +290,8 @@ def reconcile_corporate_actions_and_splits(conn=None):
                                         WHERE lot_id = ?
                                     """, [float(running_qty), float(running_price), latest_split_dt.strftime('%Y-%m-%d'), int(lot['lot_id'])])
                                     reconciled_messages.append(f"⚠️ Corporate Action Reconciled: {t} compounded to {running_qty:g} shares (Adj. Price: ₹{running_price:.2f}).")
-                except Exception:
-                    pass
+                except Exception as e:
+                    reconciled_messages.append(f"⚠️ Split check failed for {t}: {str(e)}")
             conn.commit()
     except Exception as e:
         conn.rollback()
@@ -453,6 +463,37 @@ def parse_and_import_broker_csv(file_bytes, conn, mode='Merge New Trades (Increm
         return {'success': False, 'error': 'No valid trade records could be extracted from CSV.'}
 
     records_df = pd.DataFrame(records)
+
+    # Consolidate same-day BUYs of the same ticker into a single weighted-average cost lot before checking duplicates:
+    # Consolidated Qty = sum(q_i), Weighted Avg Price = sum(q_i * p_i) / sum(q_i)
+    consolidated_records = []
+    buy_df = records_df[records_df['action'] == 'BUY']
+    sell_df = records_df[records_df['action'] == 'SELL']
+
+    if not buy_df.empty:
+        for (trade_dt, t), group in buy_df.groupby(['trade_date', 'ticker'], sort=False):
+            tot_qty = float(group['quantity'].sum())
+            if tot_qty > 0:
+                tot_outlay = float((group['quantity'] * group['price']).sum())
+                w_avg_p = round(tot_outlay / tot_qty, 2)
+                first_row = group.iloc[0]
+                consolidated_records.append({
+                    'ticker': t,
+                    'asset_name': first_row['asset_name'],
+                    'asset_class': first_row['asset_class'],
+                    'action': 'BUY',
+                    'trade_date': trade_dt,
+                    'order_time': str(first_row.get('order_time', '')),
+                    'order_id': str(first_row.get('order_id', '')),
+                    'quantity': round(tot_qty, 4),
+                    'price': w_avg_p
+                })
+
+    if not sell_df.empty:
+        for _, row in sell_df.iterrows():
+            consolidated_records.append(row.to_dict())
+
+    records_df = pd.DataFrame(consolidated_records)
     records_df['action_priority'] = records_df['action'].apply(lambda a: 0 if str(a).upper() == 'BUY' else 1)
     records_df = records_df.sort_values(by=['trade_date', 'order_time', 'action_priority'], ascending=[True, True, True])
 
