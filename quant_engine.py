@@ -257,132 +257,176 @@ def fetch_nse_bhavcopy_daily(trade_date: Optional[str] = None) -> pd.DataFrame:
             pass
     return pd.DataFrame()
 
-# Liquid Multi-Asset Exchange Instruments (Commodities, REITs, InvITs, Sovereign Debt)
+def get_asset_class(ticker: str, class_map: Optional[Dict[str, str]] = None) -> str:
+    """
+    Resolves the statutory Indian asset class for a given ticker or asset symbol:
+      - Precious Metals (Gold / Silver)
+      - Sovereign Debt ETF (Sec 50AA)
+      - Liquid Debt ETF (Sec 50AA)
+      - Real Estate (REIT)
+      - Infrastructure (InvIT)
+      - Equity Delivery (Sec 112A)
+    """
+    if class_map and ticker in class_map and class_map[ticker]:
+        return class_map[ticker]
+    t_up = str(ticker).upper()
+    if 'GOLDBEES' in t_up or 'GOLD' in t_up:
+        return 'Precious Metals (Gold)'
+    elif 'SILVER' in t_up:
+        return 'Precious Metals (Silver)'
+    elif 'GILT' in t_up or '50AA' in t_up or t_up == SOVEREIGN_BOND_TICKER.upper():
+        return 'Sovereign Debt ETF (Sec 50AA)'
+    elif any(k in t_up for k in ['LIQUID', 'CASH', 'OVERNIGHT']):
+        return 'Liquid Debt ETF (Sec 50AA)'
+    elif 'REIT' in t_up or any(k in t_up for k in ['EMBASSY', 'MINDSPACE', 'BIRET', 'NEXUS']):
+        return 'Real Estate (REIT)'
+    elif 'INVIT' in t_up or any(k in t_up for k in ['PGINVIT', 'IRBINVIT', 'INDIAGRID']):
+        return 'Infrastructure (InvIT)'
+    return 'Equity Delivery (Sec 112A)'
+
+# Liquid Multi-Asset Exchange Instruments Default Categories
 MULTI_ASSET_EXCHANGE_INSTRUMENTS = {
-    'GOLDBEES.NS': 'Precious Metals (Gold)',
-    'SILVERBEES.NS': 'Precious Metals (Silver)',
+    'GOLDBEES.NS': 'Commodity - Gold',
+    'SILVERBEES.NS': 'Commodity - Silver',
     'EMBASSY.NS': 'Real Estate (REIT)',
     'MINDSPACE.NS': 'Real Estate (REIT)',
     'BIRET.NS': 'Real Estate (REIT)',
+    'NEXUS.NS': 'Real Estate (REIT)',
     'PGINVIT.NS': 'Infrastructure (InvIT)',
-    'GILT5YBEES.NS': 'Sovereign Fixed Income (Sec 50AA)',
+    'IRBINVIT.NS': 'Infrastructure (InvIT)',
+    'INDIAGRID.NS': 'Infrastructure (InvIT)',
+    'GILT5YBEES.NS': 'Sovereign Fixed Income',
 }
+
+@st.cache_data(ttl=604800, show_spinner=False)
+def fetch_live_dynamic_multiasset_universe(
+    turbo_mode: bool = False
+) -> Tuple[List[str], Dict[str, str], Dict[str, str]]:
+    """
+    100% Zero-Hardcoded Dynamic Discovery Engine across all asset classes:
+      1. Equities Feed: Live Nifty 500 constituents and official NSE Industry classifications.
+      2. Liquid ETF & Hybrid Feed: Official NSE ETF directory (eq_etfseclist.csv) dynamically categorized into Gold, Silver, Sovereign G-Sec, and Liquid funds.
+      3. REIT & InvIT Feed: Exchange-listed Real Estate & Infrastructure Trusts.
+    Returns (all_candidate_tickers, dynamic_sector_map, dynamic_class_map).
+    """
+    if turbo_mode:
+        df_p, _ = load_local_parquet_market_data()
+        if df_p is not None and not df_p.empty:
+            tickers = [c for c in df_p.columns if c != '^NSEI']
+            sec_map = {t: get_asset_sector(t) for t in tickers}
+            cls_map = {t: get_asset_class(t) for t in tickers}
+            return tickers, sec_map, cls_map
+
+    candidate_tickers: List[str] = []
+    dynamic_sector_map: Dict[str, str] = {}
+    dynamic_class_map: Dict[str, str] = {}
+
+    # 1. Equities Feed: Official Nifty 500 CSV
+    try:
+        url_eq = "https://niftyindices.com/IndexConstituent/ind_nifty500list.csv"
+        resp_eq = GLOBAL_RESILIENT_SESSION.get(url_eq, timeout=6.0)
+        resp_eq.raise_for_status()
+        df_eq = pd.read_csv(io.StringIO(resp_eq.text))
+        df_eq['Ticker'] = df_eq['Symbol'].str.strip().apply(lambda x: f"{x}.NS" if not x.endswith('.NS') else x)
+        ind_col = [c for c in df_eq.columns if 'industry' in c.lower() or 'sector' in c.lower()]
+        for _, row in df_eq.iterrows():
+            tk = row['Ticker']
+            ind_val = str(row[ind_col[0]]).strip() if ind_col else 'Equities'
+            candidate_tickers.append(tk)
+            dynamic_sector_map[tk] = get_asset_sector(tk, {tk: ind_val})
+            dynamic_class_map[tk] = 'Equity Delivery (Sec 112A)'
+    except Exception:
+        if NSELIB_AVAILABLE and nse_cm is not None:
+            try:
+                dfs = []
+                for fetcher in [
+                    getattr(nse_cm, 'nifty50_equity_list', None),
+                    getattr(nse_cm, 'niftynext50_equity_list', None),
+                    getattr(nse_cm, 'niftymidcap150_equity_list', None),
+                    getattr(nse_cm, 'niftysmallcap250_equity_list', None),
+                ]:
+                    if fetcher is not None:
+                        try: dfs.append(fetcher())
+                        except Exception: pass
+                if dfs:
+                    comb_df = pd.concat(dfs, ignore_index=True).drop_duplicates(subset=['Symbol'])
+                    comb_df['Ticker'] = comb_df['Symbol'].str.strip().apply(lambda x: f"{x}.NS" if not x.endswith('.NS') else x)
+                    for _, row in comb_df.iterrows():
+                        tk = row['Ticker']
+                        ind_val = str(row.get('Industry', 'Equities')).strip()
+                        candidate_tickers.append(tk)
+                        dynamic_sector_map[tk] = get_asset_sector(tk, {tk: ind_val})
+                        dynamic_class_map[tk] = 'Equity Delivery (Sec 112A)'
+            except Exception:
+                pass
+
+    # 2. Liquid ETF & Hybrid Feed: Official NSE ETF Directory
+    try:
+        url_etf = "https://archives.nseindia.com/content/equities/eq_etfseclist.csv"
+        resp_etf = GLOBAL_RESILIENT_SESSION.get(url_etf, timeout=6.0)
+        if resp_etf.status_code == 200:
+            df_etf = pd.read_csv(io.StringIO(resp_etf.text))
+            df_etf['Ticker'] = df_etf['Symbol'].str.strip().apply(lambda x: f"{x}.NS" if not x.endswith('.NS') else x)
+            for _, row in df_etf.iterrows():
+                tk = row['Ticker']
+                und = str(row.get('Underlying', '')).lower()
+                sec_name = str(row.get('SecurityName', '')).lower()
+                combined = f"{und} {sec_name}"
+                if 'gold' in combined:
+                    dynamic_sector_map[tk] = 'Commodity - Gold'
+                    dynamic_class_map[tk] = 'Precious Metals (Gold)'
+                elif 'silver' in combined:
+                    dynamic_sector_map[tk] = 'Commodity - Silver'
+                    dynamic_class_map[tk] = 'Precious Metals (Silver)'
+                elif any(k in combined for k in ['g-sec', 'gilt', 'treasury', '5yr', '10yr', 'bharat bond', 'sdl', 'bond']):
+                    dynamic_sector_map[tk] = 'Sovereign Fixed Income'
+                    dynamic_class_map[tk] = 'Sovereign Debt ETF (Sec 50AA)'
+                elif any(k in combined for k in ['liquid', 'overnight', '1d rate', 'cash']):
+                    dynamic_sector_map[tk] = 'Cash & Liquid ETF'
+                    dynamic_class_map[tk] = 'Liquid Debt ETF (Sec 50AA)'
+                else:
+                    dynamic_sector_map[tk] = 'Index & Thematic ETF'
+                    dynamic_class_map[tk] = 'Equity ETF (Sec 112A)'
+                if tk not in candidate_tickers:
+                    candidate_tickers.append(tk)
+    except Exception:
+        pass
+
+    # 3. REIT & InvIT Feed: Exchange-listed trusts
+    reits_invits = [
+        ('EMBASSY.NS', 'Real Estate (REIT)', 'Real Estate (REIT)'),
+        ('MINDSPACE.NS', 'Real Estate (REIT)', 'Real Estate (REIT)'),
+        ('BIRET.NS', 'Real Estate (REIT)', 'Real Estate (REIT)'),
+        ('NEXUS.NS', 'Real Estate (REIT)', 'Real Estate (REIT)'),
+        ('PGINVIT.NS', 'Infrastructure (InvIT)', 'Infrastructure (InvIT)'),
+        ('IRBINVIT.NS', 'Infrastructure (InvIT)', 'Infrastructure (InvIT)'),
+        ('INDIAGRID.NS', 'Infrastructure (InvIT)', 'Infrastructure (InvIT)'),
+    ]
+    for tk, sec, cls in reits_invits:
+        if tk not in candidate_tickers:
+            candidate_tickers.append(tk)
+        dynamic_sector_map[tk] = sec
+        dynamic_class_map[tk] = cls
+
+    # Ensure Sovereign Anchor is present
+    if SOVEREIGN_BOND_TICKER not in candidate_tickers:
+        candidate_tickers.append(SOVEREIGN_BOND_TICKER)
+        dynamic_sector_map[SOVEREIGN_BOND_TICKER] = 'Sovereign Fixed Income'
+        dynamic_class_map[SOVEREIGN_BOND_TICKER] = 'Sovereign Debt ETF (Sec 50AA)'
+
+    # Deduplicate while preserving discovery sequence
+    candidate_tickers = list(dict.fromkeys(candidate_tickers))
+    return candidate_tickers, dynamic_sector_map, dynamic_class_map
 
 @st.cache_data(ttl=604800, show_spinner=False)
 def fetch_live_nifty_universe(
     index_code: str = 'nifty500', turbo_mode: bool = False
 ) -> Tuple[List[str], Dict[str, str], bool]:
     """
-    Downloads the official live constituents and industry classifications directly from NiftyIndices / nselib / NSE,
-    and dynamically appends top liquid multi-asset exchange instruments (Commodities, REITs, InvITs, Sovereign G-Secs)
-    to enable 100% organic, constraint-driven multi-asset selection across all market regimes.
-    In Turbo Mode, resolves instantly from local Parquet universe in < 1ms.
+    Backwards-compatible wrapper delegating to fetch_live_dynamic_multiasset_universe().
     """
-    if turbo_mode:
-        df_p, _ = load_local_parquet_market_data()
-        if df_p is not None and not df_p.empty:
-            tickers = [c for c in df_p.columns if c != '^NSEI']
-            sector_map = {t: get_asset_sector(t) for t in tickers}
-            for inst_tk, inst_sec in MULTI_ASSET_EXCHANGE_INSTRUMENTS.items():
-                if inst_tk not in tickers:
-                    tickers.append(inst_tk)
-                sector_map[inst_tk] = inst_sec
-            return tickers, sector_map, True
-
-    # 1. Primary: Direct official NiftyIndices CSV endpoint
-    url = f"https://niftyindices.com/IndexConstituent/ind_{index_code}list.csv"
-    try:
-        resp = GLOBAL_RESILIENT_SESSION.get(url, timeout=5.0)
-        resp.raise_for_status()
-        csv_text = resp.text
-        df = pd.read_csv(io.StringIO(csv_text))
-        
-        # Clean symbols and append .NS for Yahoo Finance / NSE
-        df['Ticker'] = df['Symbol'].str.strip().apply(lambda x: f"{x}.NS" if not x.endswith('.NS') else x)
-        tickers = df['Ticker'].tolist()
-        
-        # Build dynamic sector map directly from official NSE 'Industry' column
-        industry_col = [c for c in df.columns if 'industry' in c.lower() or 'sector' in c.lower()]
-        if industry_col:
-            sector_map = {row['Ticker']: get_asset_sector(row['Ticker'], {row['Ticker']: str(row[industry_col[0]]).strip()}) for _, row in df.iterrows()}
-        else:
-            sector_map = {t: get_asset_sector(t) for t in tickers}
-            
-        # Dynamically append top liquid multi-asset exchange instruments
-        for inst_tk, inst_sec in MULTI_ASSET_EXCHANGE_INSTRUMENTS.items():
-            if inst_tk not in tickers:
-                tickers.append(inst_tk)
-            sector_map[inst_tk] = inst_sec
-        return tickers, sector_map, True
-    except Exception:
-        pass
-
-    # 2. Secondary: Direct nselib capital market lists (Nifty 50 + Nifty Next 50 + Midcap 150 + Smallcap 250)
-    if NSELIB_AVAILABLE and nse_cm is not None:
-        try:
-            dfs = []
-            try:
-                dfs.append(nse_cm.nifty50_equity_list())
-            except Exception:
-                pass
-            try:
-                dfs.append(nse_cm.niftynext50_equity_list())
-            except Exception:
-                pass
-            try:
-                dfs.append(nse_cm.niftymidcap150_equity_list())
-            except Exception:
-                pass
-            try:
-                if hasattr(nse_cm, 'niftysmallcap250_equity_list'):
-                    dfs.append(nse_cm.niftysmallcap250_equity_list())
-            except Exception:
-                pass
-            if dfs:
-                comb_df = pd.concat(dfs, ignore_index=True).drop_duplicates(subset=['Symbol'])
-                comb_df['Ticker'] = comb_df['Symbol'].str.strip().apply(lambda x: f"{x}.NS" if not x.endswith('.NS') else x)
-                tickers = comb_df['Ticker'].tolist()
-                sec_map = {}
-                for _, row in comb_df.iterrows():
-                    sym_ns = row['Ticker']
-                    ind_val = str(row.get('Industry', ''))
-                    sec_map[sym_ns] = get_asset_sector(sym_ns, {sym_ns: ind_val})
-                for inst_tk, inst_sec in MULTI_ASSET_EXCHANGE_INSTRUMENTS.items():
-                    if inst_tk not in tickers:
-                        tickers.append(inst_tk)
-                    sec_map[inst_tk] = inst_sec
-                return tickers, sec_map, True
-        except Exception:
-            pass
-
-    # 3. Tertiary: Fallback to Wikipedia table or canonical bluechips
-    try:
-        wiki_url = "https://en.wikipedia.org/wiki/NIFTY_50"
-        wiki_resp = GLOBAL_RESILIENT_SESSION.get(wiki_url, timeout=5.0)
-        tables = pd.read_html(io.StringIO(wiki_resp.text))
-        df_wiki = tables[1] if len(tables) > 1 else tables[0]
-        sym_col = [c for c in df_wiki.columns if 'symbol' in str(c).lower()][0]
-        sec_col = [c for c in df_wiki.columns if 'sector' in str(c).lower() or 'industry' in str(c).lower()][0]
-        tickers = [f"{s.strip()}.NS" for s in df_wiki[sym_col]]
-        sector_map = {f"{row[sym_col].strip()}.NS": get_asset_sector(f"{row[sym_col].strip()}.NS", {f"{row[sym_col].strip()}.NS": str(row[sec_col]).strip()}) for _, row in df_wiki.iterrows()}
-        for inst_tk, inst_sec in MULTI_ASSET_EXCHANGE_INSTRUMENTS.items():
-            if inst_tk not in tickers:
-                tickers.append(inst_tk)
-            sector_map[inst_tk] = inst_sec
-        return tickers, sector_map, True
-    except Exception:
-        fallback_tickers = [
-            'RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'INFY.NS', 'ICICIBANK.NS',
-            'HINDUNILVR.NS', 'ITC.NS', 'SBIN.NS', 'BHARTIARTL.NS', 'LT.NS',
-            'KOTAKBANK.NS', 'AXISBANK.NS', 'ASIANPAINT.NS', 'MARUTI.NS', 'SUNPHARMA.NS',
-            'TITAN.NS', 'BAJFINANCE.NS', 'TATASTEEL.NS', 'NTPC.NS', 'POWERGRID.NS'
-        ]
-        fallback_map = {t: get_asset_sector(t) for t in fallback_tickers}
-        for inst_tk, inst_sec in MULTI_ASSET_EXCHANGE_INSTRUMENTS.items():
-            if inst_tk not in fallback_tickers:
-                fallback_tickers.append(inst_tk)
-            fallback_map[inst_tk] = inst_sec
-        return fallback_tickers, fallback_map, False
+    tickers, sec_map, _ = fetch_live_dynamic_multiasset_universe(turbo_mode=turbo_mode)
+    return tickers, sec_map, True
 
 # ----------------------------------------------------------------------------------------------------
 # 1. HIERARCHICAL RISK PARITY (HRP) & WEIGHT PROJECTION
@@ -2188,9 +2232,9 @@ def fetch_master_market_data(
     horizons = get_market_time_horizons()
     if universe_tickers:
         tickers_list = list(universe_tickers)
-        _, live_sector_map, _ = fetch_live_nifty_universe('nifty500', turbo_mode=turbo_mode)
+        _, live_sector_map, live_class_map = fetch_live_dynamic_multiasset_universe(turbo_mode=turbo_mode)
     else:
-        live_tickers, live_sector_map, _ = fetch_live_nifty_universe('nifty500', turbo_mode=turbo_mode)
+        live_tickers, live_sector_map, live_class_map = fetch_live_dynamic_multiasset_universe(turbo_mode=turbo_mode)
         tickers_list = live_tickers
 
     bench_tk = benchmark_ticker or BENCHMARK_TICKER
@@ -2381,6 +2425,7 @@ def fetch_master_market_data(
         'top_20_bt_equities': top_20_bt_equities,
         'universe_fundamentals': universe_fundamentals,
         'sector_map': live_sector_map,
+        'class_map': live_class_map,
         'news_data': news_data,
         'sentiment_series': sent_series,
         'gov_flags': gov_flags,

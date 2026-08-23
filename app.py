@@ -37,7 +37,8 @@ from quant_engine import (
     sync_structured_fundamentals_for_universe,
     fetch_structured_company_fundamentals, get_fundamentals_last_synced,
     get_kite_client, sync_zerodha_live_data,
-    SECTOR_MAP, get_asset_sector
+    fetch_live_dynamic_multiasset_universe,
+    SECTOR_MAP, get_asset_sector, get_asset_class
 )
 from tax_engine import (
     compute_realized_tax_summary, compute_unrealized_tax_lots_analysis, build_schedule_112a_records,
@@ -259,6 +260,8 @@ with progress_placeholder.container():
 # Stage 1: Master Market Ingestion
 p_bar.progress(20, text="📥 Ingesting Nifty 500 Universe & Sovereign Risk-Free Benchmarks...")
 master_data = fetch_master_market_data(turbo_mode=turbo_mode)
+live_sector_map = master_data.get('sector_map', {})
+live_class_map = master_data.get('class_map', {})
 
 # Data-vintage disclosure: the price/volume history actually driving today's recommendations
 # may not be today's data, especially with Turbo Mode's Parquet cache -- surface it plainly
@@ -512,7 +515,8 @@ for t in all_relevant_tickers:
     inflow_badge = inflow_info['badge']
     inflow_ratio = inflow_info['ratio']
 
-    sec = get_asset_sector(t)
+    sec = live_sector_map.get(t, get_asset_sector(t, live_sector_map))
+    cls_name = owned_summary[t]['asset_class'] if t in owned_summary else live_class_map.get(t, get_asset_class(t, live_class_map))
     if is_red_flag:
         init_action = "🔴 NEWS CIRCUIT BREAKER (GOVERNANCE ALERT)"
         init_rationale = f"Governance Alert: {red_trigger}" if red_trigger else "High-Risk News Catalyst / Regulatory Flag"
@@ -538,7 +542,7 @@ for t in all_relevant_tickers:
     order_tbl_data.append({
         'Asset': owned_summary[t]['asset_name'] if t in owned_summary else t.replace('.NS',''),
         'Sector': sec,
-        'Class': owned_summary[t]['asset_class'] if t in owned_summary else ('Real Estate (REIT)' if 'EMBASSY' in t else ('Gold ETF' if 'GOLD' in t else 'Large-Cap Equity')),
+        'Class': cls_name,
         'Live Price (₹)': p,
         'SMA-200 (₹)': sma_display,
         'Trend (200 DMA)': trend_tag,

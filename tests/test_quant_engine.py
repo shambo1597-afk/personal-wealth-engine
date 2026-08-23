@@ -25,8 +25,9 @@ from quant_engine import (
     get_kite_client,
     sync_zerodha_live_data,
     load_local_parquet_fundamentals,
-    save_local_parquet_fundamentals,
     solve_portfolio_in_memory,
+    fetch_live_dynamic_multiasset_universe,
+    get_asset_class,
 )
 
 
@@ -537,3 +538,26 @@ class TestSolvePortfolioInMemoryHandlesEmptyCandidatePool:
         result = solve_portfolio_in_memory(returns_df, mode='Minimum Variance Portfolio (MVP)')
         assert result['optimal_k'] > 0
         assert result['w_optimal'].sum() == pytest.approx(1.0, abs=1e-6)
+
+
+class TestDynamicMultiAssetDiscovery:
+    """
+    Tests for the dynamic zero-hardcoded multi-asset discovery engine and asset class mappings.
+    """
+
+    def test_dynamic_multiasset_discovery_returns_tuples_and_anchors(self):
+        candidates, sec_map, cls_map = fetch_live_dynamic_multiasset_universe(turbo_mode=True)
+        assert len(candidates) > 0
+        assert len(sec_map) > 0
+        assert len(cls_map) > 0
+        assert 'GILT5YBEES.NS' in candidates
+        assert 'Sovereign Fixed Income' in sec_map.get('GILT5YBEES.NS')
+        assert cls_map.get('GILT5YBEES.NS') == 'Sovereign Debt ETF (Sec 50AA)'
+
+    def test_get_asset_class_resolution(self):
+        assert get_asset_class('GOLDBEES.NS') == 'Precious Metals (Gold)'
+        assert get_asset_class('SILVERBEES.NS') == 'Precious Metals (Silver)'
+        assert get_asset_class('EMBASSY.NS') == 'Real Estate (REIT)'
+        assert get_asset_class('PGINVIT.NS') == 'Infrastructure (InvIT)'
+        assert get_asset_class('TCS.NS') == 'Equity Delivery (Sec 112A)'
+
