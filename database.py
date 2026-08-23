@@ -8,6 +8,8 @@ import io
 import sqlite3
 import datetime
 import collections
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -21,7 +23,7 @@ from config import (
 # ----------------------------------------------------------------------------------------------------
 # 1. DATABASE INITIALIZATION & CONNECTION POOL (WAL & THREAD-SAFE CONFIGURATION)
 # ----------------------------------------------------------------------------------------------------
-def get_db_connection():
+def get_db_connection() -> sqlite3.Connection:
     """
     Returns a thread-safe SQLite connection handle with Write-Ahead Logging (WAL),
     foreign key enforcement, busy timeout, and optimized synchronous pragmas.
@@ -33,7 +35,7 @@ def get_db_connection():
     conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
 
-def init_db():
+def init_db() -> None:
     """
     Initializes the relational tax_lots and trade_ledger tables and performance indexes if not present.
     Configures SQLite WAL mode, foreign key enforcement, and REAL decimal quantities.
@@ -78,7 +80,7 @@ def init_db():
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_trade_ledger_ticker ON trade_ledger(ticker);")
         conn.commit()
 
-def create_database_backup(db_file=DB_FILE, backup_dir='db_backups'):
+def create_database_backup(db_file: str = DB_FILE, backup_dir: str = 'db_backups') -> Optional[str]:
     """
     Creates an atomic online snapshot of the SQLite database using SQLite's native backup API.
     Maintains a rolling window of the 10 most recent backups in backup_dir and auto-prunes older files.
@@ -126,7 +128,7 @@ def create_database_backup(db_file=DB_FILE, backup_dir='db_backups'):
 
     return backup_path
 
-def backup_database(db_file=DB_FILE, backup_file='db_backups/wealth_ledger_backup.db'):
+def backup_database(db_file: str = DB_FILE, backup_file: str = 'db_backups/wealth_ledger_backup.db') -> Optional[str]:
     """
     Copies wealth_ledger.db into db_backups/wealth_ledger_backup.db whenever trades are committed.
     Also calls create_database_backup() to ensure rolling versioned snapshots are maintained.
@@ -156,7 +158,13 @@ def backup_database(db_file=DB_FILE, backup_file='db_backups/wealth_ledger_backu
 # ----------------------------------------------------------------------------------------------------
 # 2. STATUTORY EXCHANGE FRICTION & DATAFRAME SANITIZERS
 # ----------------------------------------------------------------------------------------------------
-def get_trade_friction(ticker, quantity, price, action='BUY', asset_class=''):
+def get_trade_friction(
+    ticker: str,
+    quantity: float,
+    price: float,
+    action: str = 'BUY',
+    asset_class: str = '',
+) -> float:
     """
     Calculates statutory Indian exchange friction in INR:
       - Equity Delivery: 0.15% (STT 0.1% + Brokerage/GST/Exchange turnover)
@@ -181,7 +189,7 @@ def get_trade_friction(ticker, quantity, price, action='BUY', asset_class=''):
         fees += DP_CHARGE_FLAT_INR
     return round(float(fees), 2)
 
-def clean_tax_lots_df(df):
+def clean_tax_lots_df(df: pd.DataFrame) -> pd.DataFrame:
     """
     Sanitizes raw SQLite records into strongly typed Pandas DataFrames with exact precision
     supporting fractional shares, mutual fund decimal units, and exact rupee precision.
@@ -189,7 +197,7 @@ def clean_tax_lots_df(df):
     if df.empty:
         return pd.DataFrame(columns=['lot_id', 'ticker', 'asset_name', 'asset_class', 'buy_date', 'quantity', 'buy_price', 'last_split_date'])
     
-    def parse_qty(x):
+    def parse_qty(x: Any) -> float:
         if isinstance(x, bytes):
             try:
                 import struct
@@ -200,7 +208,7 @@ def clean_tax_lots_df(df):
         try: return round(float(x), 4)
         except Exception: return 0.0
 
-    def parse_price(x):
+    def parse_price(x: Any) -> float:
         try: return round(float(x), 2)
         except Exception: return 0.0
 
@@ -216,7 +224,7 @@ def clean_tax_lots_df(df):
         df['fmv_31jan2018'] = pd.to_numeric(df['fmv_31jan2018'], errors='coerce')
     return df
 
-def clean_trade_ledger_df(df):
+def clean_trade_ledger_df(df: pd.DataFrame) -> pd.DataFrame:
     """
     Sanitizes raw trade ledger records with explicit numeric casting supporting decimal quantities
     and exact rupee precision.
@@ -236,7 +244,7 @@ def clean_trade_ledger_df(df):
 # ----------------------------------------------------------------------------------------------------
 # 3. TIMEZONE-NEUTRAL STOCK SPLIT & BONUS RECONCILER (ATOMIC TRANSACTION)
 # ----------------------------------------------------------------------------------------------------
-def reconcile_corporate_actions_and_splits(conn=None):
+def reconcile_corporate_actions_and_splits(conn: Optional[sqlite3.Connection] = None) -> List[str]:
     """
     Scans active tax lots for historical stock splits / bonuses via yfinance
     and adjusts quantities and cost bases in-place with ACID safety inside an atomic transaction.
@@ -305,7 +313,11 @@ def reconcile_corporate_actions_and_splits(conn=None):
 # ----------------------------------------------------------------------------------------------------
 # 4. BROKER TRADEBOOK CSV PARSER (ZERODHA CONSOLE & GROWW) - STRICT FIFO MATCHING & ATOMIC TRANSACTIONS
 # ----------------------------------------------------------------------------------------------------
-def parse_and_import_broker_csv(file_bytes, conn, mode='Merge New Trades (Incremental)'):
+def parse_and_import_broker_csv(
+    file_bytes: bytes,
+    conn: sqlite3.Connection,
+    mode: str = 'Merge New Trades (Incremental)',
+) -> Dict[str, Any]:
     """
     Parses Zerodha Console Tradebook, Groww Order Report, or generic broker CSV.
     Supports both Incremental Merge (with robust tranche / SIP support) and Full Ledger Reset & Rebuild.
@@ -346,7 +358,7 @@ def parse_and_import_broker_csv(file_bytes, conn, mode='Merge New Trades (Increm
     elif any('stock name' in c or 'order date' in c or 'avg. price' in c for c in col_map):
         broker_name = "Groww (Order Report)"
 
-    def find_col(possible_names):
+    def find_col(possible_names: List[str]) -> Optional[str]:
         for name in possible_names:
             for clean_col, orig_col in col_map.items():
                 if name == clean_col:
@@ -713,7 +725,11 @@ def parse_and_import_broker_csv(file_bytes, conn, mode='Merge New Trades (Increm
 # ----------------------------------------------------------------------------------------------------
 # 5. XIRR CASH FLOW COMPILER
 # ----------------------------------------------------------------------------------------------------
-def compile_xirr_cash_flows(conn, terminal_valuation, xirr_solver_func=None):
+def compile_xirr_cash_flows(
+    conn: sqlite3.Connection,
+    terminal_valuation: float,
+    xirr_solver_func: Optional[Callable[[List[float], List[str]], Tuple[float, str]]] = None,
+) -> Dict[str, Any]:
     """
     Compiles chronological cash flow ledger from SQLite:
       - BUY trades: Outflow = -(quantity * price + fees_estimated)

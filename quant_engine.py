@@ -12,6 +12,8 @@ import concurrent.futures
 import urllib.request
 import urllib.error
 import re
+from typing import Any, Dict, List, Optional, Tuple, Union
+
 import numpy as np
 import pandas as pd
 import requests
@@ -51,7 +53,7 @@ except Exception:
 # ----------------------------------------------------------------------------------------------------
 # 0. HARDENED RETRY SESSION BUILDER & CONNECTION POOLING
 # ----------------------------------------------------------------------------------------------------
-def get_resilient_session(retries=3, backoff_factor=0.5):
+def get_resilient_session(retries: int = 3, backoff_factor: float = 0.5) -> requests.Session:
     """
     Constructs a hardened requests.Session with connection pooling, browser headers,
     and automatic exponential backoff retries for resilient API communication.
@@ -172,7 +174,7 @@ SECTOR_MAP = {
     'GILT5YBEES.NS': 'Sovereign Fixed Income (Sec 50AA)'
 }
 
-def get_asset_sector(ticker, sector_map=None):
+def get_asset_sector(ticker: str, sector_map: Optional[Dict[str, str]] = None) -> str:
     """
     Resolves canonical macroeconomic catalyst sector for a given ticker or asset symbol.
     Normalizes granular industry classifications to canonical catalyst sectors.
@@ -222,7 +224,7 @@ def get_asset_sector(ticker, sector_map=None):
     
     return s_clean
 
-def fetch_nse_corporate_actions(symbol=None):
+def fetch_nse_corporate_actions(symbol: Optional[str] = None) -> pd.DataFrame:
     """
     Fetches official NSE corporate actions (splits, bonuses, dividends) directly from NSE India via nselib.
     """
@@ -236,7 +238,7 @@ def fetch_nse_corporate_actions(symbol=None):
             return pd.DataFrame()
     return pd.DataFrame()
 
-def fetch_nse_bhavcopy_daily(trade_date=None):
+def fetch_nse_bhavcopy_daily(trade_date: Optional[str] = None) -> pd.DataFrame:
     """
     Fetches official daily NSE Bhavcopy EOD prices and delivery volumes directly from NSE India.
     trade_date: 'dd-mm-yyyy' string or None for latest available.
@@ -266,7 +268,9 @@ MULTI_ASSET_EXCHANGE_INSTRUMENTS = {
 }
 
 @st.cache_data(ttl=604800, show_spinner=False)
-def fetch_live_nifty_universe(index_code='nifty200', turbo_mode=False):
+def fetch_live_nifty_universe(
+    index_code: str = 'nifty200', turbo_mode: bool = False
+) -> Tuple[List[str], Dict[str, str], bool]:
     """
     Downloads the official live constituents and industry classifications directly from NiftyIndices / nselib / NSE,
     and dynamically appends top liquid multi-asset exchange instruments (Commodities, REITs, InvITs, Sovereign G-Secs)
@@ -377,7 +381,7 @@ def fetch_live_nifty_universe(index_code='nifty200', turbo_mode=False):
 # ----------------------------------------------------------------------------------------------------
 # 1. HIERARCHICAL RISK PARITY (HRP) & WEIGHT PROJECTION
 # ----------------------------------------------------------------------------------------------------
-def compute_hrp_weights(candidate_returns, shrunk_cov):
+def compute_hrp_weights(candidate_returns: pd.DataFrame, shrunk_cov: np.ndarray) -> np.ndarray:
     """
     Executes Marcos Lopez de Prado's Hierarchical Risk Parity (HRP) via true dendrogram 
     hierarchy tree traversal and recursive bisection over the Ledoit-Wolf correlation matrix (< 3ms).
@@ -460,7 +464,7 @@ def compute_hrp_weights(candidate_returns, shrunk_cov):
         raw_weights = np.ones(N, dtype=float) / N
     return raw_weights
 
-def project_weights_capped(weights, cap=MAX_RETAIL_CAP):
+def project_weights_capped(weights: np.ndarray, cap: float = MAX_RETAIL_CAP) -> np.ndarray:
     """
     Strict water-filling projection onto the probability simplex with upper bound w_i <= cap.
     Guarantees np.all(w <= cap) and np.isclose(sum(w), 1.0) whenever len(w) >= 1/cap.
@@ -501,7 +505,13 @@ def project_weights_capped(weights, cap=MAX_RETAIL_CAP):
                 break
     return w
 
-def project_weights_sector_capped(weights, tickers, max_asset_cap=MAX_RETAIL_CAP, max_sector_cap=MAX_SECTOR_CAP, sector_map=None):
+def project_weights_sector_capped(
+    weights: np.ndarray,
+    tickers: List[str],
+    max_asset_cap: float = MAX_RETAIL_CAP,
+    max_sector_cap: float = MAX_SECTOR_CAP,
+    sector_map: Optional[Dict[str, str]] = None,
+) -> np.ndarray:
     """
     SECTOR CONCENTRATION ENVELOPE (25% CAP) & ASSET CONVICTION CAP (20% CAP):
     Executes constrained quadratic projection onto the probability simplex with:
@@ -596,7 +606,9 @@ def project_weights_sector_capped(weights, tickers, max_asset_cap=MAX_RETAIL_CAP
 # ----------------------------------------------------------------------------------------------------
 # 1C. LIFECYCLE ASSET ALLOCATION & LIABILITY-DRIVEN INVESTMENT (LDI) CASH SHIELD
 # ----------------------------------------------------------------------------------------------------
-def compute_lifecycle_asset_allocation(exact_age: float, years_to_goal: float, rolling_60d_vol: float = 0.15):
+def compute_lifecycle_asset_allocation(
+    exact_age: float, years_to_goal: float, rolling_60d_vol: float = 0.15
+) -> Dict[str, Any]:
     """
     Upgrades lifecycle asset allocation engine with a 3-Year Liability-Driven Investment (LDI) Cash Shield
     to eliminate Sequence of Returns Risk and pandemic/market crash shock on target withdrawal dates.
@@ -671,7 +683,7 @@ def compute_lifecycle_asset_allocation(exact_age: float, years_to_goal: float, r
 # 1B. AUTONOMOUS LIVE RISK-FREE RATE FETCHING ENGINE
 # ----------------------------------------------------------------------------------------------------
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_live_indian_risk_free_rate(turbo_mode=False):
+def fetch_live_indian_risk_free_rate(turbo_mode: bool = False) -> Tuple[float, bool, str]:
     """
     Returns the official Indian Sovereign Risk-Free Rate benchmark (91-Day T-Bill / RBI Baseline).
     SEBI statutory benchmark for computing Sharpe ratios and Modern Portfolio Theory tangency in India.
@@ -684,14 +696,14 @@ def fetch_live_indian_risk_free_rate(turbo_mode=False):
 # ----------------------------------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def solve_portfolio_in_memory(
-    returns_df, 
-    mode='Max-Sharpe (Ledoit-Wolf)', 
-    risk_free_rate=0.065, 
-    max_retail_cap=0.20, 
-    shrunk_cov=None, 
-    mean_returns=None,
-    sector_map=None
-):
+    returns_df: pd.DataFrame,
+    mode: str = 'Max-Sharpe (Ledoit-Wolf)',
+    risk_free_rate: float = 0.065,
+    max_retail_cap: float = 0.20,
+    shrunk_cov: Optional[np.ndarray] = None,
+    mean_returns: Optional[np.ndarray] = None,
+    sector_map: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
     """
     Tier 2: Pure mathematical optimization engine for Markowitz Max-Sharpe, MVP, and HRP allocations.
     Embeds sector concentration constraints directly into SLSQP line search, applies Ledoit-Wolf shrinkage,
@@ -851,7 +863,9 @@ def solve_portfolio_in_memory(
         'optimal_k': len(selected_tickers)
     }
 
-def run_markowitz_optimization(candidate_returns, mode='Max-Sharpe (Ledoit-Wolf)', rf_rate=None):
+def run_markowitz_optimization(
+    candidate_returns: pd.DataFrame, mode: str = 'Max-Sharpe (Ledoit-Wolf)', rf_rate: Optional[float] = None
+) -> Dict[str, Any]:
     """Backwards-compatible alias for solve_portfolio_in_memory."""
     rf = rf_rate if rf_rate is not None else RISK_FREE_RATE
     return solve_portfolio_in_memory(candidate_returns, mode=mode, risk_free_rate=rf, max_retail_cap=MAX_RETAIL_CAP)
@@ -874,7 +888,7 @@ if os.path.exists(PARQUET_FUNDAMENTALS_PATH) and os.path.getsize(PARQUET_FUNDAME
     except Exception:
         pass
 
-def ensure_market_data_dir():
+def ensure_market_data_dir() -> None:
     """Ensures local data directory exists."""
     os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -1007,7 +1021,17 @@ SECTOR_FUNDAMENTAL_BENCHMARKS = {
     'Realty': {'roe': 9.5, 'npm': 14.0, 'de': 0.85, 'pe': 45.0, 'turnover': 0.25, 'leverage': 2.70},
 }
 
-def compute_piotroski_f_score(ticker, roe=None, npm=None, de=None, turnover=None, leverage=None, sector=None, raw_fundamentals=None, yf_info=None):
+def compute_piotroski_f_score(
+    ticker: str,
+    roe: Optional[float] = None,
+    npm: Optional[float] = None,
+    de: Optional[float] = None,
+    turnover: Optional[float] = None,
+    leverage: Optional[float] = None,
+    sector: Optional[str] = None,
+    raw_fundamentals: Optional[Dict[str, Any]] = None,
+    yf_info: Optional[Dict[str, Any]] = None,
+) -> Tuple[int, str, str, Dict[str, bool]]:
     """
     Computes the discrete 9-Point Piotroski F-Score (0 to 9) for equity constituents based on:
       1. Profitability (4 points):
@@ -1141,7 +1165,9 @@ def compute_piotroski_f_score(ticker, roe=None, npm=None, de=None, turnover=None
 
     return score, label, display, breakdown
 
-def load_local_parquet_fundamentals(fundamentals_path=PARQUET_FUNDAMENTALS_PATH, max_age_days=30):
+def load_local_parquet_fundamentals(
+    fundamentals_path: str = PARQUET_FUNDAMENTALS_PATH, max_age_days: int = 30
+) -> Optional[pd.DataFrame]:
     """
     Loads local Parquet fundamentals table in < 15ms if it exists and is less than max_age_days old (default 30 days).
     Validates that the file contains piotroski_f_score and is not corrupted with identical dummy ROE values.
@@ -1177,7 +1203,7 @@ def load_local_parquet_fundamentals(fundamentals_path=PARQUET_FUNDAMENTALS_PATH,
     except Exception:
         return None
 
-def save_local_parquet_fundamentals(df_fund, fundamentals_path=PARQUET_FUNDAMENTALS_PATH):
+def save_local_parquet_fundamentals(df_fund: pd.DataFrame, fundamentals_path: str = PARQUET_FUNDAMENTALS_PATH) -> bool:
     """
     Persists universe fundamentals DataFrame to local Parquet file.
     """
@@ -1190,7 +1216,7 @@ def save_local_parquet_fundamentals(df_fund, fundamentals_path=PARQUET_FUNDAMENT
     except Exception:
         return False
 
-def _fetch_single_fundamental(t, sector=None, turbo_mode=False):
+def _fetch_single_fundamental(t: str, sector: Optional[str] = None, turbo_mode: bool = False) -> Dict[str, Any]:
     """
     Verified, realistic fundamental data engine for Nifty constituents.
     Combines exact audited bluechip metrics, real Yahoo Finance live metrics, and
@@ -1280,7 +1306,9 @@ def _fetch_single_fundamental(t, sector=None, turbo_mode=False):
     }
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_universe_fundamentals(tickers, sector_map=None, turbo_mode=False):
+def fetch_universe_fundamentals(
+    tickers: List[str], sector_map: Optional[Dict[str, str]] = None, turbo_mode: bool = False
+) -> pd.DataFrame:
     """
     High-performance Persistent Local Fundamentals Store with 30-day Parquet cache.
     
@@ -1324,21 +1352,21 @@ def fetch_universe_fundamentals(tickers, sector_map=None, turbo_mode=False):
     return df
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_fundamental_scorecard(tickers):
+def fetch_fundamental_scorecard(tickers: List[str]) -> pd.DataFrame:
     """Legacy helper returning formatted dataframe for Tab 3."""
     return fetch_universe_fundamentals(tickers)
 
 def compute_multifactor_rankings(
-    price_history_df, 
-    raw_tickers, 
-    fundamentals_df, 
-    volume_history_df=None,
-    adtv_series=None, 
-    min_adtv=MIN_ADTV_INR, 
-    top_n=TOP_N_SELECTED_EQUITIES, 
-    sentiment_series=None, 
-    governance_flags=None
-):
+    price_history_df: pd.DataFrame,
+    raw_tickers: List[str],
+    fundamentals_df: pd.DataFrame,
+    volume_history_df: Optional[pd.DataFrame] = None,
+    adtv_series: Optional[pd.Series] = None,
+    min_adtv: float = MIN_ADTV_INR,
+    top_n: int = TOP_N_SELECTED_EQUITIES,
+    sentiment_series: Optional[pd.Series] = None,
+    governance_flags: Optional[Dict[str, str]] = None,
+) -> pd.DataFrame:
     """
     COMPOSITE MULTI-FACTOR SCORING PIPELINE WITH INSTITUTIONAL VOLUME ACCUMULATION & QUALITY GATE:
       1. ADTV Liquidity Filter: Disqualifies equities with 90-day median turnover < MIN_ADTV_INR (₹10 Cr).
@@ -1626,7 +1654,9 @@ STRUCTURAL_POLICY_CATALYSTS = {
     'RECLTD.NS': '💡 Infrastructure & Power Transmission Project Loan Expansion'
 }
 
-def compute_institutional_accumulation_factor(volume_df, window_short=5, window_long=90):
+def compute_institutional_accumulation_factor(
+    volume_df: pd.DataFrame, window_short: int = 5, window_long: int = 90
+) -> Tuple[pd.Series, pd.Series]:
     """
     Calculates empirical Institutional Volume Accumulation Ratios across a universe volume DataFrame:
       Accumulation_Ratio = Mean Volume (Last 5 Days) / Median Volume (Last 90 Days)
@@ -1663,7 +1693,7 @@ def compute_institutional_accumulation_factor(volume_df, window_short=5, window_
 RED_FLAG_KEYWORDS = ['fraud', 'probe', 'sebi', 'raid', 'cbi', 'ed', 'default', 'resigns', 'scandal', 'penalty', 'downgrade']
 BULLISH_KEYWORDS = ['profit rises', 'record revenue', 'order win', 'bonus', 'dividend', 'upgrade', 'expansion', 'beats estimate']
 
-def analyze_ticker_sentiment(news_items):
+def analyze_ticker_sentiment(news_items: List[Dict[str, Any]]) -> Tuple[float, str, str]:
     """
     Lightweight keyword scanner for corporate governance alerts & structural catalyst tags.
     Returns (score, governance_flag, trigger_headline).
@@ -1707,7 +1737,7 @@ def analyze_ticker_sentiment(news_items):
 
     return float(np.round(score, 2)), gov_flag, trigger
 
-def _fetch_single_ticker_news(t):
+def _fetch_single_ticker_news(t: str) -> Tuple[str, List[Dict[str, Any]]]:
     """Worker function to fetch news items for a single ticker."""
     try:
         raw_news = yf.Ticker(t, session=GLOBAL_RESILIENT_SESSION).news
@@ -1739,7 +1769,7 @@ def _fetch_single_ticker_news(t):
         return t, []
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_recent_news(tickers, turbo_mode=False):
+def fetch_recent_news(tickers: List[str], turbo_mode: bool = False) -> Dict[str, List[Dict[str, Any]]]:
     """Fetches latest corporate announcements and market news for tickers with 30m cache and 2.0s strict timeout. In Turbo Mode, returns empty dictionary instantly (< 0.1ms)."""
     if turbo_mode or not tickers:
         return {t: [] for t in tickers}
@@ -1758,7 +1788,11 @@ def fetch_recent_news(tickers, turbo_mode=False):
             news_by_ticker[t] = []
     return news_by_ticker
 
-def compute_news_sentiment_for_universe(tickers, news_data=None, turbo_mode=False):
+def compute_news_sentiment_for_universe(
+    tickers: List[str],
+    news_data: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    turbo_mode: bool = False,
+) -> Tuple[pd.Series, Dict[str, str], Dict[str, str]]:
     """
     Computes Sentiment_Score and Governance_Flag for all tickers in universe.
     Returns (sentiment_series, governance_dict, triggers_dict).
@@ -1784,7 +1818,7 @@ def compute_news_sentiment_for_universe(tickers, news_data=None, turbo_mode=Fals
 
 _IN_MEMORY_PRICES_CACHE = None
 
-def get_in_memory_prices_df():
+def get_in_memory_prices_df() -> Optional[pd.DataFrame]:
     """Returns cached in-memory DataFrame of market_prices.parquet (< 0.1ms)."""
     global _IN_MEMORY_PRICES_CACHE
     if _IN_MEMORY_PRICES_CACHE is None and os.path.exists(PARQUET_PRICES_PATH):
@@ -1795,7 +1829,7 @@ def get_in_memory_prices_df():
     return _IN_MEMORY_PRICES_CACHE
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_latest_prices(all_relevant_tickers, turbo_mode=False):
+def fetch_latest_prices(all_relevant_tickers: List[str], turbo_mode: bool = False) -> pd.Series:
     """
     ⚡ Instant Local Price Resolution Engine:
       1. Attempts to read the last available row directly from local data/market_prices.parquet in memory (< 1ms).
@@ -1893,7 +1927,7 @@ def fetch_latest_prices(all_relevant_tickers, turbo_mode=False):
 # DATA_DIR, PARQUET_PRICES_PATH, PARQUET_VOLUMES_PATH, and ensure_market_data_dir()
 # are already defined in Section 3 (lines ~848-865). No redefinition needed.
 
-def _standardize_market_df(df):
+def _standardize_market_df(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
     """Ensures DatetimeIndex without timezone and clean string column names."""
     if df is None or df.empty:
         return df
@@ -1907,7 +1941,9 @@ def _standardize_market_df(df):
     clean_df.columns = [str(c) for c in clean_df.columns]
     return clean_df
 
-def load_local_parquet_market_data(prices_path=PARQUET_PRICES_PATH, volumes_path=PARQUET_VOLUMES_PATH):
+def load_local_parquet_market_data(
+    prices_path: str = PARQUET_PRICES_PATH, volumes_path: str = PARQUET_VOLUMES_PATH
+) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
     """
     Loads local Parquet price and volume time-series tables in < 15ms.
     Returns (df_prices, df_volumes) or (None, None) if missing or unreadable.
@@ -1930,7 +1966,12 @@ def load_local_parquet_market_data(prices_path=PARQUET_PRICES_PATH, volumes_path
     except Exception:
         return None, None
 
-def save_local_parquet_market_data(df_prices, df_volumes, prices_path=PARQUET_PRICES_PATH, volumes_path=PARQUET_VOLUMES_PATH):
+def save_local_parquet_market_data(
+    df_prices: pd.DataFrame,
+    df_volumes: pd.DataFrame,
+    prices_path: str = PARQUET_PRICES_PATH,
+    volumes_path: str = PARQUET_VOLUMES_PATH,
+) -> bool:
     """
     Persists cleaned price and volume time-series DataFrames to local Parquet files
     and updates the global in-memory cache for instant zero-latency reads.
@@ -1951,7 +1992,9 @@ def save_local_parquet_market_data(df_prices, df_volumes, prices_path=PARQUET_PR
     except Exception:
         return False
 
-def _extract_ohlcv_close_volume(raw_download, expected_tickers=None):
+def _extract_ohlcv_close_volume(
+    raw_download: pd.DataFrame, expected_tickers: Optional[List[str]] = None
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Robustly unpacks Close and Volume DataFrames from yfinance multi-index or single-index download output.
     """
@@ -1991,7 +2034,13 @@ def _extract_ohlcv_close_volume(raw_download, expected_tickers=None):
     volume_df = _standardize_market_df(volume_df)
     return close_df, volume_df
 
-def validate_and_clean_market_prices(raw_prices_df, raw_volumes_df=None, max_consecutive_nan=5, return_threshold=0.35, turbo_mode=False):
+def validate_and_clean_market_prices(
+    raw_prices_df: pd.DataFrame,
+    raw_volumes_df: Optional[pd.DataFrame] = None,
+    max_consecutive_nan: int = 5,
+    return_threshold: float = 0.35,
+    turbo_mode: bool = False,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
     Strict Data Validation & Institutional Integrity Firewall for NSE market time-series.
     
@@ -2164,7 +2213,13 @@ def validate_and_clean_market_prices(raw_prices_df, raw_volumes_df=None, max_con
     return sanitized_df, integrity_report
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_master_market_data(universe_tickers=None, benchmark_ticker=None, train_start_str=None, today_str=None, turbo_mode=False):
+def fetch_master_market_data(
+    universe_tickers: Optional[List[str]] = None,
+    benchmark_ticker: Optional[str] = None,
+    train_start_str: Optional[str] = None,
+    today_str: Optional[str] = None,
+    turbo_mode: bool = False,
+) -> Dict[str, Any]:
     """
     Tier 1: High-performance local Parquet time-series database with automated incremental daily sync.
     Reads verified historical data in < 15ms. Pre-computes multi-factor scorecards, liquidity gates,
@@ -2363,12 +2418,18 @@ def fetch_master_market_data(universe_tickers=None, benchmark_ticker=None, train
         'data_integrity_report': data_integrity_report
     }
 
-def fetch_cached_market_data(turbo_mode=False):
+def fetch_cached_market_data(turbo_mode: bool = False) -> Dict[str, Any]:
     """Alias for fetch_master_market_data."""
     return fetch_master_market_data(turbo_mode=turbo_mode)
 
 @st.cache_data(show_spinner=False)
-def compute_vectorized_monte_carlo_frontier(active_cov_matrix, active_mean_vector, rf_rate=0.065, n_sim=3000, max_retail_cap=MAX_RETAIL_CAP):
+def compute_vectorized_monte_carlo_frontier(
+    active_cov_matrix: np.ndarray,
+    active_mean_vector: np.ndarray,
+    rf_rate: float = 0.065,
+    n_sim: int = 3000,
+    max_retail_cap: float = MAX_RETAIL_CAP,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Ultra-fast vectorized Monte Carlo Efficient Frontier generator.
     Simulates n_sim portfolios with MAX_RETAIL_CAP constraint across the 2D tensor in < 0.05s.
@@ -2386,7 +2447,7 @@ def compute_vectorized_monte_carlo_frontier(active_cov_matrix, active_mean_vecto
     return weights, p_rets, p_vols, p_srs
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def ingest_and_run_dual_pipeline(mode='Max-Sharpe (Ledoit-Wolf)', rf_rate=None):
+def ingest_and_run_dual_pipeline(mode: str = 'Max-Sharpe (Ledoit-Wolf)', rf_rate: Optional[float] = None) -> Dict[str, Any]:
     """
     Orchestrates the decoupled dual quantitative pipeline in < 0.02s using cached master market data.
     """
@@ -2434,7 +2495,7 @@ def ingest_and_run_dual_pipeline(mode='Max-Sharpe (Ledoit-Wolf)', rf_rate=None):
 # ----------------------------------------------------------------------------------------------------
 # 6. EXACT ANNUALIZED MONEY-WEIGHTED XIRR ENGINE (NEWTON-RAPHSON)
 # ----------------------------------------------------------------------------------------------------
-def compute_portfolio_xirr(cash_flows, dates):
+def compute_portfolio_xirr(cash_flows: List[float], dates: List[Any]) -> Tuple[float, str]:
     """
     Solves for exact annualized money-weighted rate of return (XIRR) $r$ via Newton-Raphson:
       \sum_{i=1}^n \frac{C_i}{(1 + r)^{(d_i - d_0) / 365.0}} = 0
@@ -2504,11 +2565,11 @@ def compute_portfolio_xirr(cash_flows, dates):
 # 7. ZERO-DEFECT ZERODHA BASKET ALLOCATION HELPER
 # ----------------------------------------------------------------------------------------------------
 def compute_zerodha_order_basket(
-    target_weights, 
-    latest_prices, 
-    total_capital_inr, 
-    cash_buffer_pct=0.015
-):
+    target_weights: Union[Dict[str, float], pd.Series],
+    latest_prices: Union[Dict[str, float], pd.Series],
+    total_capital_inr: float,
+    cash_buffer_pct: float = 0.015,
+) -> Tuple[pd.DataFrame, float]:
     """
     Converts continuous optimal float weights into discrete whole share quantities
     for live execution on Zerodha Kite / Indian exchanges with statutory cash buffer protection.
