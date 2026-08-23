@@ -169,3 +169,36 @@ class TestSameDayTradeConsolidation:
         conn.close()
         assert len(sell_rows) == 2
         assert {round(r[0], 4) for r in sell_rows} == {5.0, 7.0}
+
+
+class TestKiteHoldingsSync:
+    def test_sync_kite_holdings_inserts_tax_lots(self, isolated_db):
+        conn = isolated_db.get_db_connection()
+        try:
+            holdings = [
+                {'ticker': 'TCS.NS', 'quantity': 15, 'buy_price': 3450.0},
+                {'ticker': 'INFY.NS', 'quantity': 40, 'buy_price': 1480.0},
+            ]
+            res = isolated_db.sync_kite_holdings_to_tax_lots(holdings, conn, mode='Full Ledger Reset & Rebuild')
+            assert res['success'] is True
+            assert res['imported_count'] == 2
+
+            lots = conn.execute("SELECT ticker, quantity, buy_price FROM tax_lots ORDER BY ticker").fetchall()
+            assert len(lots) == 2
+            assert lots[0][0] == 'INFY.NS'
+            assert lots[0][1] == 40.0
+            assert lots[0][2] == 1480.0
+            assert lots[1][0] == 'TCS.NS'
+            assert lots[1][1] == 15.0
+            assert lots[1][2] == 3450.0
+        finally:
+            conn.close()
+
+    def test_sync_kite_holdings_empty_returns_cleanly(self, isolated_db):
+        conn = isolated_db.get_db_connection()
+        try:
+            res = isolated_db.sync_kite_holdings_to_tax_lots([], conn)
+            assert res['success'] is True
+            assert res['imported_count'] == 0
+        finally:
+            conn.close()

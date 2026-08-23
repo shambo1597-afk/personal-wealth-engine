@@ -723,6 +723,113 @@ def parse_and_import_broker_csv(
     }
 
 # ----------------------------------------------------------------------------------------------------
+# 4B. ZERODHA KITE CONNECT LIVE HOLDINGS SYNCHRONIZER
+# ----------------------------------------------------------------------------------------------------
+def sync_kite_holdings_to_tax_lots(
+    holdings: List[Dict[str, Any]],
+    conn: sqlite3.Connection,
+    mode: str = 'Merge New Trades (Incremental)',
+) -> Dict[str, Any]:
+    """
+    Synchronizes live Demat holdings fetched from Zerodha KiteConnect into SQLite tax_lots.
+    """
+    if not holdings:
+        return {'success': True, 'imported_count': 0, 'updated_count': 0, 'total_invested': 0.0, 'holdings_count': 0}
+
+    create_database_backup()
+    cursor = conn.cursor()
+    imported_count = 0
+    updated_count = 0
+    total_invested = 0.0
+    today_str = datetime.date.today().strftime('%Y-%m-%d')
+
+    try:
+        if 'Full Ledger Reset' in mode:
+            cursor.execute("DELETE FROM tax_lots")
+            for h in holdings:
+                ticker = str(h.get('ticker', '')).strip().upper()
+                if not ticker.endswith('.NS') and not ticker.endswith('.BO'):
+                    ticker = f"{ticker}.NS"
+                qty = float(h.get('quantity', 0.0))
+                price = float(h.get('buy_price', 0.0))
+                if qty <= 0 or price <= 0:
+                    continue
+
+                if ticker == 'GILT5YBEES.NS':
+                    asset_name = 'GILT5YBEES (5-Yr G-Sec)'
+                    asset_class = 'Sovereign Debt ETF (Sec 50AA)'
+                elif ticker == 'EMBASSY.NS':
+                    asset_name = 'Embassy Office Parks REIT'
+                    asset_class = 'Real Estate (REIT)'
+                elif ticker == 'GOLDBEES.NS':
+                    asset_name = 'Nippon India ETF Gold BeES'
+                    asset_class = 'Gold ETF'
+                else:
+                    asset_name = ticker.replace('.NS', '')
+                    asset_class = 'Large-Cap Equity'
+
+                cursor.execute("""
+                    INSERT INTO tax_lots (ticker, asset_name, asset_class, buy_date, quantity, buy_price, last_split_date)
+                    VALUES (?, ?, ?, ?, ?, ?, '')
+                """, [ticker, asset_name, asset_class, today_str, qty, price])
+                imported_count += 1
+                total_invested += qty * price
+        else:
+            # Incremental Merge / Update existing holdings
+            for h in holdings:
+                ticker = str(h.get('ticker', '')).strip().upper()
+                if not ticker.endswith('.NS') and not ticker.endswith('.BO'):
+                    ticker = f"{ticker}.NS"
+                qty = float(h.get('quantity', 0.0))
+                price = float(h.get('buy_price', 0.0))
+                if qty <= 0 or price <= 0:
+                    continue
+
+                if ticker == 'GILT5YBEES.NS':
+                    asset_name = 'GILT5YBEES (5-Yr G-Sec)'
+                    asset_class = 'Sovereign Debt ETF (Sec 50AA)'
+                elif ticker == 'EMBASSY.NS':
+                    asset_name = 'Embassy Office Parks REIT'
+                    asset_class = 'Real Estate (REIT)'
+                elif ticker == 'GOLDBEES.NS':
+                    asset_name = 'Nippon India ETF Gold BeES'
+                    asset_class = 'Gold ETF'
+                else:
+                    asset_name = ticker.replace('.NS', '')
+                    asset_class = 'Large-Cap Equity'
+
+                cursor.execute("SELECT lot_id, quantity, buy_price FROM tax_lots WHERE ticker = ? AND quantity > 0", [ticker])
+                existing = cursor.fetchall()
+                if existing:
+                    # Update quantity and weighted average price of primary lot
+                    primary_lot_id = existing[0][0]
+                    cursor.execute("UPDATE tax_lots SET quantity = ?, buy_price = ? WHERE lot_id = ?", [qty, price, primary_lot_id])
+                    # Remove any duplicate active lots for this ticker
+                    for extra in existing[1:]:
+                        cursor.execute("DELETE FROM tax_lots WHERE lot_id = ?", [extra[0]])
+                    updated_count += 1
+                else:
+                    cursor.execute("""
+                        INSERT INTO tax_lots (ticker, asset_name, asset_class, buy_date, quantity, buy_price, last_split_date)
+                        VALUES (?, ?, ?, ?, ?, ?, '')
+                    """, [ticker, asset_name, asset_class, today_str, qty, price])
+                    imported_count += 1
+                total_invested += qty * price
+
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        return {'success': False, 'error': f"Failed to sync Kite holdings: {str(e)}"}
+
+    return {
+        'success': True,
+        'imported_count': imported_count,
+        'updated_count': updated_count,
+        'total_invested': round(total_invested, 2),
+        'holdings_count': len(holdings)
+    }
+
+# ----------------------------------------------------------------------------------------------------
 # 5. XIRR CASH FLOW COMPILER
 # ----------------------------------------------------------------------------------------------------
 def compile_xirr_cash_flows(
