@@ -228,6 +228,22 @@ with progress_placeholder.container():
 p_bar.progress(20, text="📥 Ingesting Nifty 200 Universe & Sovereign Risk-Free Benchmarks...")
 master_data = fetch_master_market_data(turbo_mode=turbo_mode)
 
+# Data-vintage disclosure: the price/volume history actually driving today's recommendations
+# may not be today's data, especially with Turbo Mode's Parquet cache -- surface it plainly
+# rather than let a stale run look identical to a fresh one.
+_valid_assets_for_vintage = master_data.get('valid_assets')
+if _valid_assets_for_vintage is not None and not _valid_assets_for_vintage.empty:
+    _data_asof_ts = pd.to_datetime(_valid_assets_for_vintage.index.max())
+    _data_age_days = (TODAY.normalize() - _data_asof_ts.normalize()).days
+    if _data_age_days <= 1:
+        st.sidebar.caption(f"🟢 **Price Data As Of:** `{_data_asof_ts.strftime('%d-%b-%Y')}` (current)")
+    elif _data_age_days <= 5:
+        st.sidebar.caption(f"🟡 **Price Data As Of:** `{_data_asof_ts.strftime('%d-%b-%Y')}` ({_data_age_days}d old)")
+    else:
+        st.sidebar.caption(f"🔴 **Price Data As Of:** `{_data_asof_ts.strftime('%d-%b-%Y')}` ({_data_age_days}d old — stale, refresh before trading)")
+if turbo_mode:
+    st.sidebar.caption("⚡ **Turbo Mode ON:** reading from local Parquet cache, not a fresh live pull. Toggle it off and rerun before you rely on these numbers for a real order.")
+
 # Stage 2: Multi-Factor Scoring & Quality Gates
 p_bar.progress(45, text="📊 Scoring 3-Stage DuPont Quality, 12M Momentum & Piotroski Safety Gates...")
 live_sector_map = master_data.get('sector_map', {})
@@ -919,6 +935,12 @@ with tab_ticket:
     if total_available_broker_cash > 0:
         st.info("💡 **Tax-Free Cash Rebalancing Active:** Fresh cash is automatically routed to underweight assets to restore optimal tangency with zero sell friction.")
     st.info("💡 **Instructions for Zerodha / Groww:** Place Delivery (CNC) Market Orders for the 🟢 BUY signals below, then click '💾 Commit Trades to SQLite Database' in the sidebar to lock your ledger.")
+    st.warning(
+        "⚠️ **Before you place any order:** the Piotroski F-Score gate behind these BUY/BLOCK decisions runs on "
+        "a static fundamentals snapshot, not live filings (see the 'Multi-Factor Quality & Momentum Scorecard' "
+        "tab → **Fundamentals Source** column for which stocks are hand-curated vs. sector-average estimates). "
+        "Cross-check any position's real financials before you act on it."
+    )
     
     with st.expander("⚡ 1-Click Zerodha Kite Basket Order Exporter", expanded=False):
         basket_mode = st.radio(
@@ -1287,6 +1309,14 @@ with tab_visuals:
 with tab_dupont:
     st.subheader("📊 Multi-Factor Intelligence & DuPont Analytics Hub (Nifty 200 Universe)")
     st.caption("ℹ️ **Integrated Quantitative Screening Engine:** Combines 90-Day ADTV Liquidity Gate (≥₹10 Cr), 3-Stage DuPont Quality (Margin × Turnover × Leverage), 12M-1M Momentum, 60D Realized Volatility Penalty, and Institutional Volume Accumulation ($Z_{accum}$) with Forensic Governance Circuit Breakers.")
+    st.warning(
+        "⚠️ **Fundamentals Data Provenance:** DuPont ROE, Net Margin, Debt/Equity, and Piotroski F-Score inputs "
+        "below are **not fetched live from filings**. Large-caps use a hand-curated snapshot baked into the "
+        "code (`CALIBRATED_CONSTITUENT_FUNDAMENTALS` in `quant_engine.py`, undated); everything else falls back "
+        "to a **sector-average estimate**, not that company's actual financials. Before trusting the Piotroski "
+        "F-Score ≤3 buy-block on any specific position, verify the underlying numbers yourself against the "
+        "company's latest quarterly/annual filing (e.g. on screener.in or the exchange's disclosures)."
+    )
 
     # -------------------------------------------------------------------------
     # 1. GOVERNANCE & RED-FLAG CIRCUIT BREAKER ALERT BANNER
@@ -1497,6 +1527,7 @@ with tab_dupont:
             f_score_val = int(fund_row.get('piotroski_f_score', fund_row.get('f_score_num', 7)))
             f_badge_val = str(fund_row.get('piotroski_badge', fund_row.get('f_score_label', '🔵 Moderate (5-7/9)')))
             f_disp_val = str(fund_row.get('Piotroski F-Score', fund_row.get('f_score_display', f"{f_score_val}/9 ★" if f_score_val >= 8 else f"{f_score_val}/9")))
+            data_source_val = str(fund_row.get('Data Source', selected_row.get('Fundamentals Source', 'Sector-Average Estimate')))
         else:
             turnover_val = float(selected_row.get('turnover_num', 0.75))
             leverage_val = float(selected_row.get('leverage_num', 1.0 + de_val))
@@ -1505,9 +1536,14 @@ with tab_dupont:
             f_score_val = int(selected_row.get('piotroski_f_score', selected_row.get('Piotroski_F_Score', 7)))
             f_badge_val = str(selected_row.get('piotroski_badge', selected_row.get('F_Score_Label', '🔵 Moderate (5-7/9)')))
             f_disp_val = str(selected_row.get('Piotroski F-Score', selected_row.get('Piotroski_Score', f"{f_score_val}/9 ★" if f_score_val >= 8 else f"{f_score_val}/9")))
+            data_source_val = str(selected_row.get('Fundamentals Source', 'Sector-Average Estimate'))
 
         with st.container(border=True):
             st.markdown(f"##### 🏢 **{selected_asset}** (`{sel_ticker}`) — DuPont 3-Stage & Piotroski Breakdown")
+            if data_source_val == 'Calibrated Snapshot':
+                st.caption("📌 **Fundamentals Source: Calibrated Snapshot** — a hand-curated, undated figure baked into the code, not a live filing. Verify against the company's latest quarterly/annual report before trusting the F-Score gate.")
+            else:
+                st.caption("📊 **Fundamentals Source: Sector-Average Estimate** — this ticker has no company-specific snapshot; the numbers below reflect its *sector's* average, not its own balance sheet. Verify independently before trusting the F-Score gate.")
             st.latex(r"\text{DuPont ROE} = \underbrace{\left(\frac{\text{Net Income}}{\text{Revenue}}\right)}_{\text{Net Profit Margin}} \times \underbrace{\left(\frac{\text{Revenue}}{\text{Total Assets}}\right)}_{\text{Asset Turnover}} \times \underbrace{\left(\frac{\text{Total Assets}}{\text{Total Equity}}\right)}_{\text{Financial Leverage}}")
             
             d_c1, d_c2, d_c3, d_c4, d_c5, d_c6 = st.columns(6)
@@ -1600,7 +1636,7 @@ with tab_dupont:
         table_cols = [
             'Rank', 'Asset', 'Selection_Status', 'ADTV_90d_Cr', 'Institutional Inflow', 'Accumulation_Ratio',
             'Piotroski_Score', 'ROE_Clean', 'Momentum_Pct', 'DE_Clean', 'NPM_Clean', 'Vol_60d_Pct',
-            'Governance', 'Fundamental Health'
+            'Governance', 'Fundamental Health', 'Fundamentals Source'
         ]
         valid_table_cols = [c for c in table_cols if c in scorecard_display_df.columns]
 
@@ -1646,6 +1682,14 @@ with tab_dupont:
                 "Vol_60d_Pct": st.column_config.NumberColumn("60D Realized Vol", format="%.1f%%", width="small"),
                 "Governance": st.column_config.TextColumn("Governance Flag", width="small"),
                 "Fundamental Health": st.column_config.TextColumn("Health Classification", width="medium"),
+                "Fundamentals Source": st.column_config.TextColumn(
+                    "Fundamentals Source",
+                    help="'Calibrated Snapshot' = a hand-curated, undated figure baked into the code. "
+                         "'Sector-Average Estimate' = no company-specific data at all -- this row reflects "
+                         "the sector average, not this company's own financials. Neither is live. Verify "
+                         "against the company's actual filings before trusting the F-Score gate.",
+                    width="medium"
+                ),
             },
             hide_index=True,
             use_container_width=True

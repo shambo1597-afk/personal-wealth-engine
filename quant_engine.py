@@ -1218,14 +1218,22 @@ def save_local_parquet_fundamentals(df_fund: pd.DataFrame, fundamentals_path: st
 
 def _fetch_single_fundamental(t: str, sector: Optional[str] = None, turbo_mode: bool = False) -> Dict[str, Any]:
     """
-    Verified, realistic fundamental data engine for Nifty constituents.
-    Combines exact audited bluechip metrics, real Yahoo Finance live metrics, and
-    industry-calibrated financial profiles with deterministic dispersion and 9-point Piotroski F-Score.
+    NOT LIVE DATA. Every value here comes from one of two static sources, never from a live
+    filing or API call:
+      1. CALIBRATED_CONSTITUENT_FUNDAMENTALS -- a hand-curated, undated snapshot dict for ~100
+         large-caps, frozen at whatever point it was written into this file.
+      2. SECTOR_FUNDAMENTAL_BENCHMARKS -- a sector-average fallback for everything else, which
+         reflects the sector, not the individual company's actual balance sheet.
+    The returned dict's 'Data Source' key tells you which path was used for a given ticker.
+    Before trusting the Piotroski F-Score gate on any real trade, cross-check the company's
+    current filings yourself -- this function will not detect a deterioration or improvement
+    that happened after these numbers were written.
     """
     clean_sym = t.replace('.NS', '')
     live_info = None
-    
-    # 1. Exact audited constituent profile match
+
+    # 1. Hand-curated constituent snapshot match (NOT live -- see CALIBRATED_CONSTITUENT_FUNDAMENTALS
+    #    docstring for provenance/staleness caveats).
     if t in CALIBRATED_CONSTITUENT_FUNDAMENTALS:
         prof = CALIBRATED_CONSTITUENT_FUNDAMENTALS[t]
         roe_val = float(prof['roe'])
@@ -1234,13 +1242,15 @@ def _fetch_single_fundamental(t: str, sector: Optional[str] = None, turbo_mode: 
         pe_val = float(prof['pe'])
         turnover_val = float(prof.get('turnover', 0.75))
         leverage_val = float(prof.get('leverage', 1.85))
+        data_source = 'Calibrated Snapshot'
     else:
         prof = None
         roe_val = None
         npm_val = None
         de_val = None
         pe_val = None
-        
+        data_source = 'Sector-Average Estimate'
+
         # 3. Industry-calibrated fallback with clean deterministic sector averages
         if roe_val is None or npm_val is None or de_val is None or pe_val is None:
             # Determine sector benchmark
@@ -1302,7 +1312,8 @@ def _fetch_single_fundamental(t: str, sector: Optional[str] = None, turbo_mode: 
         'npm_num': float(np.round(npm_val, 2)),
         'turnover_num': float(np.round(turnover_val, 2)),
         'leverage_num': float(np.round(leverage_val, 2)),
-        'pe_num': float(np.round(pe_val, 2))
+        'pe_num': float(np.round(pe_val, 2)),
+        'Data Source': data_source,
     }
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -1482,6 +1493,7 @@ def compute_multifactor_rankings(
     de_series = pd.Series(index=valid_cols, dtype=float)
     pe_series = pd.Series(index=valid_cols, dtype=float)
     health_series = pd.Series(index=valid_cols, dtype=object)
+    data_source_series = pd.Series(index=valid_cols, dtype=object)
 
     for t in valid_cols:
         if t in fund_map.index:
@@ -1494,8 +1506,10 @@ def compute_multifactor_rankings(
             f_lb = str(row.get('piotroski_badge', row.get('f_score_label', '🔵 Moderate (5-7/9)')))
             f_disp = str(row.get('Piotroski F-Score', row.get('f_score_display', f"{f_sc}/9 ★" if f_sc >= 8 else f"{f_sc}/9")))
             h_tag = str(row.get('Fundamental Health', '✅ High Quality (Solvent)'))
+            d_src = str(row.get('Data Source', 'Sector-Average Estimate'))
         else:
             roe_val, de_val, npm_val, pe_val, f_sc, f_lb, f_disp, h_tag = 16.0, 0.40, 14.0, 25.0, 7, '🔵 Moderate (5-7/9)', '7/9', '✅ High Quality (Solvent)'
+            d_src = 'Sector-Average Estimate'
 
         roe_series[t] = roe_val
         de_series[t] = de_val
@@ -1506,6 +1520,7 @@ def compute_multifactor_rankings(
         npm_series[t] = npm_val
         pe_series[t] = pe_val
         health_series[t] = h_tag
+        data_source_series[t] = d_src
 
     # 6. Legacy NLP Sentiment Series (for backwards compatibility)
     if sentiment_series is not None:
@@ -1575,7 +1590,8 @@ def compute_multifactor_rankings(
         'DE_Clean': de_series,
         'NPM_Clean': npm_series,
         'PE_Clean': pe_series,
-        'Fundamental Health': health_series
+        'Fundamental Health': health_series,
+        'Fundamentals Source': data_source_series
     })
 
     # Liquid equities with safe F-scores are prioritized; decaying / illiquid ones are gated out
