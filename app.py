@@ -34,7 +34,7 @@ from quant_engine import (
     fetch_fundamental_scorecard, fetch_live_indian_risk_free_rate, compute_vectorized_monte_carlo_frontier,
     analyze_ticker_sentiment, compute_news_sentiment_for_universe,
     compute_lifecycle_asset_allocation,
-    sync_structured_fundamentals_for_universe, sync_screener_fundamentals_for_universe,
+    sync_structured_fundamentals_for_universe,
     fetch_structured_company_fundamentals, get_fundamentals_last_synced,
     get_kite_client, sync_zerodha_live_data,
     SECTOR_MAP, get_asset_sector
@@ -519,7 +519,7 @@ for t in all_relevant_tickers:
     elif not f_info['safe']:
         init_action = "⛔ FUNDAMENTALS NOT SYNCED (BUY BLOCKED)" if f_sc is None else "⛔ F-SCORE DETERIORATING (BUY BLOCKED)"
         init_rationale = (
-            "No audited Screener.in fundamentals synced for this ticker — Buy Blocked pending sync"
+            "No audited fundamentals synced for this ticker — Buy Blocked pending sync"
             if f_sc is None else
             f"F-Score: {f_disp} ({f_badge}) — Balance Sheet Deteriorating (Buy Blocked)"
         )
@@ -671,7 +671,7 @@ for t in pass1_priority_order:
         if gap > 0 or order_tbl.loc[t, 'Shares Owned'] > 0:
             if f_sc is None:
                 order_tbl.loc[t, 'Action'] = "⛔ FUNDAMENTALS NOT SYNCED (BUY BLOCKED)"
-                order_tbl.loc[t, 'Quantitative Rationale'] = "No audited Screener.in fundamentals synced for this ticker — Fresh Capital Blocked pending sync"
+                order_tbl.loc[t, 'Quantitative Rationale'] = "No audited fundamentals synced for this ticker — Fresh Capital Blocked pending sync"
             else:
                 order_tbl.loc[t, 'Action'] = "⛔ F-SCORE DETERIORATING (BUY BLOCKED)"
                 order_tbl.loc[t, 'Quantitative Rationale'] = f"F-Score Decay ({f_disp} — {f_badge}) | Decaying Balance Sheet — Fresh Capital Blocked"
@@ -1003,11 +1003,9 @@ with tab_ticket:
         st.info("💡 **Tax-Free Cash Rebalancing Active:** Fresh cash is automatically routed to underweight assets to restore optimal tangency with zero sell friction.")
     st.info("💡 **Instructions for Zerodha / Groww:** Place Delivery (CNC) Market Orders for the 🟢 BUY signals below, then click '💾 Commit Trades to SQLite Database' in the sidebar to lock your ledger.")
     st.warning(
-        "⚠️ **Before you place any order:** the Piotroski F-Score gate now runs on audited financials "
-        "extracted from Screener.in (see the 'Multi-Factor Quality & Momentum Scorecard' tab → **🔄 Sync "
-        "Audited Filings** and the **Fundamentals Source** column), but this extraction has never been "
-        "verified against a live Screener.in page -- run a sync yourself and spot-check a few tickers' "
-        "numbers in your browser before trusting a single order below. A ⛔ **FUNDAMENTALS NOT SYNCED** "
+        "⚠️ **Before you place any order:** the Piotroski F-Score gate runs on audited financials "
+        "ingested via structured REST pipelines (see the 'Multi-Factor Quality & Momentum Scorecard' tab → **🔄 Sync "
+        "Audited Structured Financials** and the **Fundamentals Source** column). A ⛔ **FUNDAMENTALS NOT SYNCED** "
         "action means this ticker has no verified data at all and is blocked until you sync."
     )
     
@@ -1070,7 +1068,7 @@ with tab_ticket:
         'SMA-200 (₹)': lambda x: f"₹{x:.2f}" if pd.notna(x) else "-",
         'Current Value (₹)': '₹{:,.2f}',
         'Target Value (₹)': '₹{:,.2f}'
-    }), use_container_width=True)
+    }), width="stretch")
 
     with st.expander('📰 Live News & Catalyst Monitor', expanded=False):
         st.caption("Review recent news headlines and corporate catalysts for your selected portfolio constituents prior to placing orders.")
@@ -1120,7 +1118,7 @@ with tab_visuals:
             title="Empirical Correlation Matrix (Shrunk via Ledoit-Wolf)"
         )
         fig1.update_layout(height=450, margin=dict(l=20, r=20, t=40, b=20))
-        st.plotly_chart(fig1, use_container_width=True)
+        st.plotly_chart(fig1, width="stretch")
 
     # FIGURE 2: OPTIMAL ALLOCATION PIE CHART
     with vis_row1_col2:
@@ -1133,7 +1131,7 @@ with tab_visuals:
         )
         fig4.update_traces(textposition='inside', textinfo='percent+label')
         fig4.update_layout(height=450, margin=dict(l=20, r=20, t=40, b=20), showlegend=False)
-        st.plotly_chart(fig4, use_container_width=True)
+        st.plotly_chart(fig4, width="stretch")
 
     st.markdown("---")
     
@@ -1256,13 +1254,13 @@ with tab_visuals:
             margin=dict(l=20, r=20, t=50, b=20),
             legend=dict(orientation="h", yanchor="bottom", y=-0.35, xanchor="center", x=0.5)
         )
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width="stretch")
     else:
         st.info(
             "📭 **No eligible candidates yet.** The optimizer has nothing to build an efficient frontier from -- "
             "this means the audited fundamentals store hasn't been synced (or every candidate is currently "
             "blocked by the Quality/F-Score gate). Go to the 'Multi-Factor Quality & Momentum Scorecard' tab "
-            "and click **🔄 Sync Audited Filings from Screener.in**, then come back here."
+            "and click **🔄 Sync Audited Structured Financials**, then come back here."
         )
 
     st.markdown("---")
@@ -1381,7 +1379,7 @@ with tab_visuals:
             hovermode='x unified',
             legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5)
         )
-        st.plotly_chart(fig3, use_container_width=True)
+        st.plotly_chart(fig3, width="stretch")
     else:
         st.info(
             "📭 **No eligible candidates in the backtest training window either.** Same root cause as "
@@ -1605,7 +1603,7 @@ with tab_dupont:
             margin=dict(l=20, r=20, t=50, b=20),
             legend=dict(orientation="h", yanchor="bottom", y=-0.22, xanchor="center", x=0.5)
         )
-        st.plotly_chart(fig_quad, use_container_width=True)
+        st.plotly_chart(fig_quad, width="stretch")
 
     st.markdown("---")
 
@@ -1800,15 +1798,14 @@ with tab_dupont:
                 "Fundamental Health": st.column_config.TextColumn("Health Classification", width="medium"),
                 "Fundamentals Source": st.column_config.TextColumn(
                     "Fundamentals Source",
-                    help="'Screener.in (Audited)' = extracted from this company's own audited filings via "
-                         "Sync (unverified scraper -- spot-check it). 'Not Applicable (Financial Institution)' "
-                         "= a bank/NBFC the 9-point F-Score doesn't apply to; ROE/D-E are still real. "
+                    help="'Structured REST (Audited)' / 'Audited REST Ingestion' = extracted from audited annual filings. "
+                         "'Not Applicable (Financial Institution)' = a bank/NBFC the 9-point F-Score doesn't apply to; ROE/D-E are still real. "
                          "'Sync Failed' / 'Not Yet Synced' = no verified data at all; fresh BUYs are blocked.",
                     width="medium"
                 ),
             },
             hide_index=True,
-            use_container_width=True
+            width="stretch"
         )
 
 # --- TAB 4: TAX HARVESTING & CAPITAL GAINS CENTER ---
@@ -1883,7 +1880,7 @@ with tab_harvest:
                 'Estimated Realized Loss (₹)': '₹{:,.2f}',
                 'Tax Savings (₹)': '₹{:,.2f}',
                 'Post-Harvest Tax Liability': '₹{:,.2f}'
-            }), use_container_width=True)
+            }), width="stretch")
         else:
             st.warning(f"💡 **Tax Alpha Opportunity:** You have ₹{tax_payable_111a:,.2f} in STCG tax liabilities. (No active unrealized loss positions currently found to harvest).")
     else:
@@ -1894,7 +1891,7 @@ with tab_harvest:
     # Table 1: Qualified LTCG Harvesting
     st.markdown("#### 1. 💎 Qualified Section 112A LTCG Profits (Holding Period ≥ 365 Days)")
     if unrealized_tax_analysis['harvest_rows']:
-        st.dataframe(pd.DataFrame(unrealized_tax_analysis['harvest_rows']), use_container_width=True)
+        st.dataframe(pd.DataFrame(unrealized_tax_analysis['harvest_rows']), width="stretch")
         st.success(f"• **Total Available LTCG Profit:** ₹{unrealized_tax_analysis['total_harvestable_profit']:,.2f} / ₹1,25,000 Annual Tax-Free Quota")
     else:
         st.info("✓ Zero unrealized LTCG profits qualifying for tax-free Section 112A harvest today.")
@@ -1904,7 +1901,7 @@ with tab_harvest:
     # Table 2: Tax-Loss Harvesting
     st.markdown("#### 2. 📉 Tax-Loss Harvesting Inspector (Offsetting STCG / LTCG Liabilities)")
     if unrealized_tax_analysis['loss_rows']:
-        st.dataframe(pd.DataFrame(unrealized_tax_analysis['loss_rows']), use_container_width=True)
+        st.dataframe(pd.DataFrame(unrealized_tax_analysis['loss_rows']), width="stretch")
         st.warning(f"• **Total Harvestable Capital Losses:** ₹{unrealized_tax_analysis['total_harvestable_losses']:,.2f} available to neutralize capital gains tax.")
     else:
         st.info("✓ Zero positions with unrealized losses in your portfolio.")
@@ -1953,7 +1950,7 @@ with tab_db:
     if all_db_lots.empty:
         st.info("No active tax lots currently recorded in database. Upload a CSV tradebook in the sidebar or execute orders to populate.")
     else:
-        st.dataframe(all_db_lots, use_container_width=True)
+        st.dataframe(all_db_lots, width="stretch")
 
     st.markdown("---")
     st.markdown("#### 2. Immutable Execution Audit Trail (`trade_ledger`)")
@@ -1964,7 +1961,7 @@ with tab_db:
             'price': '₹{:.2f}',
             'realized_pnl': '₹{:,.2f}',
             'fees_estimated': '₹{:.2f}'
-        }), use_container_width=True)
+        }), width="stretch")
 
     st.markdown("---")
     st.markdown("#### 3. 📑 Revenue Audit & Schedule 112A / Schedule CG Tax Export Engine")
@@ -2013,7 +2010,7 @@ with tab_db:
             'Realized Capital Gain / Loss': '₹{:,.2f}'
         }
         active_sched_format = {k: v for k, v in sched_format_dict.items() if k in schedule_df.columns}
-        st.dataframe(schedule_df.style.format(active_sched_format), use_container_width=True)
+        st.dataframe(schedule_df.style.format(active_sched_format), width="stretch")
 
     st.markdown("---")
     st.markdown("#### 4. 🔄 Corporate Actions & Stock Split Synchronization")
