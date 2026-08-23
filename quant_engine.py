@@ -710,6 +710,20 @@ def solve_portfolio_in_memory(
     Embeds sector concentration constraints directly into SLSQP line search, applies Ledoit-Wolf shrinkage,
     and guarantees 20% single-asset cap and 25% sector cap.
     """
+    # No eligible candidates to optimize over (e.g. the fundamentals store hasn't been synced
+    # yet, so every ticker is buy-blocked) -- return a well-defined empty portfolio instead of
+    # letting LedoitWolf/SLSQP crash on a zero-column input.
+    if returns_df is None or returns_df.empty or returns_df.shape[1] == 0:
+        return {
+            'tickers': [],
+            'clean_tickers': [],
+            'w_optimal': np.array([], dtype=float),
+            'active_returns_df': pd.DataFrame(),
+            'active_cov_matrix': np.zeros((0, 0)),
+            'active_mean_vector': np.array([], dtype=float),
+            'optimal_k': 0,
+        }
+
     if sector_map is None:
         sector_map = SECTOR_MAP
 
@@ -2558,14 +2572,25 @@ def fetch_master_market_data(
     oos_bench = bench_series.loc[bench_series.index >= pd.to_datetime(oos_split_str)]
     oos_assets = oos_window[[t for t in bt_selected_universe if t in oos_window.columns]].ffill().bfill().dropna()
 
-    # Pre-fit Ledoit-Wolf covariance matrices in RAM for sub-20ms solver speed
-    lw_live = LedoitWolf().fit(live_returns_df)
-    live_shrunk_cov = lw_live.covariance_ * 252
-    live_mean_returns = live_returns_df.mean().values * 252
+    # Pre-fit Ledoit-Wolf covariance matrices in RAM for sub-20ms solver speed. Guard against an
+    # empty selected universe (e.g. the fundamentals store hasn't been synced yet, so every
+    # ticker is buy-blocked) -- LedoitWolf.fit() raises on a zero-column input rather than
+    # returning something usable, so this must be checked before it's called, not caught after.
+    if not live_returns_df.empty and live_returns_df.shape[1] > 0:
+        lw_live = LedoitWolf().fit(live_returns_df)
+        live_shrunk_cov = lw_live.covariance_ * 252
+        live_mean_returns = live_returns_df.mean().values * 252
+    else:
+        live_shrunk_cov = np.zeros((0, 0))
+        live_mean_returns = np.array([], dtype=float)
 
-    lw_bt = LedoitWolf().fit(backtest_train_df)
-    bt_shrunk_cov = lw_bt.covariance_ * 252
-    bt_mean_returns = backtest_train_df.mean().values * 252
+    if not backtest_train_df.empty and backtest_train_df.shape[1] > 0:
+        lw_bt = LedoitWolf().fit(backtest_train_df)
+        bt_shrunk_cov = lw_bt.covariance_ * 252
+        bt_mean_returns = backtest_train_df.mean().values * 252
+    else:
+        bt_shrunk_cov = np.zeros((0, 0))
+        bt_mean_returns = np.array([], dtype=float)
 
     return {
         'live_returns_df': live_returns_df,

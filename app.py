@@ -322,6 +322,15 @@ regime_desc = lifecycle_alloc['regime_desc']
 
 st.caption(f"Execution Date: **{TODAY.strftime('%d-%B-%Y')}** | Engine: **{opt_mode}** | Active Market Regime: **{regime_tag}** (60d Realized Vol: **{rolling_60d_vol*100:.1f}%**)")
 
+if OPTIMAL_K == 0:
+    st.error(
+        "🔴 **No eligible candidates for fresh capital right now.** Every Nifty 200 constituent is "
+        "either blocked by the Piotroski F-Score Quality Gate or has no audited fundamentals synced "
+        "yet -- this is the expected state on a fresh install. Go to the **'Multi-Factor Quality & "
+        "Momentum Scorecard'** tab and click **🔄 Sync Audited Filings from Screener.in**, then rerun. "
+        "Existing holdings below are unaffected; only new BUY selection is empty."
+    )
+
 # Stage 4: Valuations, 200-DMA Trend Filter & FIFO Tax Lots
 p_bar.progress(85, text="🛡️ Applying 200-DMA Trend Filter, LDI Cash Shield & Tax FIFO Engine...")
 
@@ -1090,242 +1099,256 @@ with tab_visuals:
 
     st.markdown("---")
     
-    # FIGURE 3: EFFICIENT FRONTIER
-    st.markdown("#### Figure 3: Modern Portfolio Theory: Efficient Frontier & Capital Market Line (CML)")
-    def get_p_metrics(w):
-        ret = np.dot(w, active_mean_vector)
-        vol = np.sqrt(np.dot(w.T, np.dot(active_cov_matrix, w)))
-        sr = (ret - RISK_FREE_RATE) / vol if vol > 0 else 0
-        return ret, vol, sr
+    if OPTIMAL_K > 0:
+        # FIGURE 3: EFFICIENT FRONTIER
+        st.markdown("#### Figure 3: Modern Portfolio Theory: Efficient Frontier & Capital Market Line (CML)")
+        def get_p_metrics(w):
+            ret = np.dot(w, active_mean_vector)
+            vol = np.sqrt(np.dot(w.T, np.dot(active_cov_matrix, w)))
+            sr = (ret - RISK_FREE_RATE) / vol if vol > 0 else 0
+            return ret, vol, sr
 
-    # Ultra-fast vectorized Dirichlet Monte Carlo (< 0.05s)
-    _, mc_rets, mc_vols, mc_srs = compute_vectorized_monte_carlo_frontier(
-        active_cov_matrix, active_mean_vector, rf_rate=RISK_FREE_RATE, n_sim=3000
-    )
+        # Ultra-fast vectorized Dirichlet Monte Carlo (< 0.05s)
+        _, mc_rets, mc_vols, mc_srs = compute_vectorized_monte_carlo_frontier(
+            active_cov_matrix, active_mean_vector, rf_rate=RISK_FREE_RATE, n_sim=3000
+        )
 
-    act_bounds = tuple((0.0, MAX_RETAIL_CAP) for _ in range(OPTIMAL_K))
-    act_cons = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0})
-    act_init = np.ones(OPTIMAL_K) / OPTIMAL_K
+        act_bounds = tuple((0.0, MAX_RETAIL_CAP) for _ in range(OPTIMAL_K))
+        act_cons = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0})
+        act_init = np.ones(OPTIMAL_K) / OPTIMAL_K
 
-    opt_sr_res = minimize(lambda w: -get_p_metrics(w)[2], act_init, method='SLSQP', bounds=act_bounds, constraints=act_cons)
-    opt_mv_res = minimize(lambda w: np.dot(w.T, np.dot(active_cov_matrix, w)), act_init, method='SLSQP', bounds=act_bounds, constraints=act_cons)
+        opt_sr_res = minimize(lambda w: -get_p_metrics(w)[2], act_init, method='SLSQP', bounds=act_bounds, constraints=act_cons)
+        opt_mv_res = minimize(lambda w: np.dot(w.T, np.dot(active_cov_matrix, w)), act_init, method='SLSQP', bounds=act_bounds, constraints=act_cons)
 
-    sr_ret_val, sr_vol_val, sr_sharpe_val = get_p_metrics(opt_sr_res.x)
-    mv_ret_val, mv_vol_val, mv_sharpe_val = get_p_metrics(opt_mv_res.x)
+        sr_ret_val, sr_vol_val, sr_sharpe_val = get_p_metrics(opt_sr_res.x)
+        mv_ret_val, mv_vol_val, mv_sharpe_val = get_p_metrics(opt_mv_res.x)
 
-    t_rets_trace = np.linspace(mv_ret_val, sr_ret_val * 1.05, 30)
-    eff_vols_trace = []
-    for tr in t_rets_trace:
-        c = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0}, {'type': 'eq', 'fun': lambda w: np.dot(w, active_mean_vector) - tr})
-        res_tr = minimize(lambda w: np.dot(w.T, np.dot(active_cov_matrix, w)), act_init, method='SLSQP', bounds=act_bounds, constraints=c)
-        eff_vols_trace.append(np.sqrt(res_tr.fun) if res_tr.success else np.nan)
+        t_rets_trace = np.linspace(mv_ret_val, sr_ret_val * 1.05, 30)
+        eff_vols_trace = []
+        for tr in t_rets_trace:
+            c = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0}, {'type': 'eq', 'fun': lambda w: np.dot(w, active_mean_vector) - tr})
+            res_tr = minimize(lambda w: np.dot(w.T, np.dot(active_cov_matrix, w)), act_init, method='SLSQP', bounds=act_bounds, constraints=c)
+            eff_vols_trace.append(np.sqrt(res_tr.fun) if res_tr.success else np.nan)
 
-    client_cml_ret = (w_safe * RISK_FREE_RATE * 100) + (w_risky * sr_ret_val * 100)
-    client_cml_vol = w_risky * sr_vol_val * 100
+        client_cml_ret = (w_safe * RISK_FREE_RATE * 100) + (w_risky * sr_ret_val * 100)
+        client_cml_vol = w_risky * sr_vol_val * 100
 
-    bench_ann_ret = bench_returns.mean() * 252
-    bench_ann_vol = bench_returns.std() * np.sqrt(252)
+        bench_ann_ret = bench_returns.mean() * 252
+        bench_ann_vol = bench_returns.std() * np.sqrt(252)
 
-    cml_x = np.linspace(0, sr_vol_val * 1.4, 50)
-    cml_y = RISK_FREE_RATE + ((sr_ret_val - RISK_FREE_RATE) / sr_vol_val) * cml_x
+        cml_x = np.linspace(0, sr_vol_val * 1.4, 50)
+        cml_y = RISK_FREE_RATE + ((sr_ret_val - RISK_FREE_RATE) / sr_vol_val) * cml_x
 
-    fig2 = go.Figure()
+        fig2 = go.Figure()
 
-    fig2.add_trace(go.Scatter(
-        x=mc_vols * 100,
-        y=mc_rets * 100,
-        mode='markers',
-        marker=dict(
-            color=mc_srs,
-            colorscale='Viridis',
-            size=5,
-            opacity=0.35,
-            showscale=True,
-            colorbar=dict(title=dict(text=f'Sharpe Ratio<br>(Rf={RISK_FREE_RATE*100:.1f}%)', side='top'), x=1.02)
-        ),
-        name='Simulated Portfolios',
-        hovertemplate='Vol: %{x:.2f}%<br>Return: %{y:.2f}%<br>Sharpe: %{marker.color:.2f}<extra></extra>'
-    ))
+        fig2.add_trace(go.Scatter(
+            x=mc_vols * 100,
+            y=mc_rets * 100,
+            mode='markers',
+            marker=dict(
+                color=mc_srs,
+                colorscale='Viridis',
+                size=5,
+                opacity=0.35,
+                showscale=True,
+                colorbar=dict(title=dict(text=f'Sharpe Ratio<br>(Rf={RISK_FREE_RATE*100:.1f}%)', side='top'), x=1.02)
+            ),
+            name='Simulated Portfolios',
+            hovertemplate='Vol: %{x:.2f}%<br>Return: %{y:.2f}%<br>Sharpe: %{marker.color:.2f}<extra></extra>'
+        ))
 
-    fig2.add_trace(go.Scatter(
-        x=np.array(eff_vols_trace) * 100,
-        y=t_rets_trace * 100,
-        mode='lines',
-        line=dict(color='deepskyblue', width=3),
-        name='Efficient Frontier (Markowitz)'
-    ))
+        fig2.add_trace(go.Scatter(
+            x=np.array(eff_vols_trace) * 100,
+            y=t_rets_trace * 100,
+            mode='lines',
+            line=dict(color='deepskyblue', width=3),
+            name='Efficient Frontier (Markowitz)'
+        ))
 
-    fig2.add_trace(go.Scatter(
-        x=cml_x * 100,
-        y=cml_y * 100,
-        mode='lines',
-        line=dict(color='gold', width=2.5, dash='dash'),
-        name='Capital Market Line (CML)'
-    ))
+        fig2.add_trace(go.Scatter(
+            x=cml_x * 100,
+            y=cml_y * 100,
+            mode='lines',
+            line=dict(color='gold', width=2.5, dash='dash'),
+            name='Capital Market Line (CML)'
+        ))
 
-    fig2.add_trace(go.Scatter(
-        x=[sr_vol_val * 100],
-        y=[sr_ret_val * 100],
-        mode='markers',
-        marker=dict(color='crimson', size=14, symbol='star', line=dict(color='white', width=1.5)),
-        name=f'Optimal Risky Basket (Sharpe={sr_sharpe_val:.2f})'
-    ))
+        fig2.add_trace(go.Scatter(
+            x=[sr_vol_val * 100],
+            y=[sr_ret_val * 100],
+            mode='markers',
+            marker=dict(color='crimson', size=14, symbol='star', line=dict(color='white', width=1.5)),
+            name=f'Optimal Risky Basket (Sharpe={sr_sharpe_val:.2f})'
+        ))
 
-    fig2.add_trace(go.Scatter(
-        x=[mv_vol_val * 100],
-        y=[mv_ret_val * 100],
-        mode='markers',
-        marker=dict(color='blue', size=12, symbol='circle', line=dict(color='white', width=1.5)),
-        name=f'Minimum Variance Basket (Vol={mv_vol_val*100:.1f}%)'
-    ))
+        fig2.add_trace(go.Scatter(
+            x=[mv_vol_val * 100],
+            y=[mv_ret_val * 100],
+            mode='markers',
+            marker=dict(color='blue', size=12, symbol='circle', line=dict(color='white', width=1.5)),
+            name=f'Minimum Variance Basket (Vol={mv_vol_val*100:.1f}%)'
+        ))
 
-    cml_target_name = (
-        f'YOUR TARGET ALLOCATION ({w_risky*100:.0f}% Eq / {w_safe*100:.0f}% Bond) [🛡️ LDI Shield Active]'
-        if years_to_goal <= 3.0 else
-        f'YOUR TARGET ALLOCATION ({w_risky*100:.0f}% Eq / {w_safe*100:.0f}% Bond)'
-    )
-    fig2.add_trace(go.Scatter(
-        x=[client_cml_vol],
-        y=[client_cml_ret],
-        mode='markers',
-        marker=dict(color='lime', size=16, symbol='diamond', line=dict(color='black', width=2)),
-        name=cml_target_name
-    ))
+        cml_target_name = (
+            f'YOUR TARGET ALLOCATION ({w_risky*100:.0f}% Eq / {w_safe*100:.0f}% Bond) [🛡️ LDI Shield Active]'
+            if years_to_goal <= 3.0 else
+            f'YOUR TARGET ALLOCATION ({w_risky*100:.0f}% Eq / {w_safe*100:.0f}% Bond)'
+        )
+        fig2.add_trace(go.Scatter(
+            x=[client_cml_vol],
+            y=[client_cml_ret],
+            mode='markers',
+            marker=dict(color='lime', size=16, symbol='diamond', line=dict(color='black', width=2)),
+            name=cml_target_name
+        ))
 
-    fig2.add_trace(go.Scatter(
-        x=[bench_ann_vol * 100],
-        y=[bench_ann_ret * 100],
-        mode='markers',
-        marker=dict(color='black', size=12, symbol='square', line=dict(color='white', width=1.5)),
-        name=f'Nifty 50 Index (Vol={bench_ann_vol*100:.1f}%)'
-    ))
+        fig2.add_trace(go.Scatter(
+            x=[bench_ann_vol * 100],
+            y=[bench_ann_ret * 100],
+            mode='markers',
+            marker=dict(color='black', size=12, symbol='square', line=dict(color='white', width=1.5)),
+            name=f'Nifty 50 Index (Vol={bench_ann_vol*100:.1f}%)'
+        ))
 
-    fig2.update_layout(
-        title=dict(text=f'Efficient Frontier & Your CML Target (Live K* = {OPTIMAL_K} Assets)', x=0.5),
-        xaxis_title='Annualized Volatility / Risk (%)',
-        yaxis_title='Annualized Expected Return (%)',
-        height=550,
-        margin=dict(l=20, r=20, t=50, b=20),
-        legend=dict(orientation="h", yanchor="bottom", y=-0.35, xanchor="center", x=0.5)
-    )
-    st.plotly_chart(fig2, use_container_width=True)
+        fig2.update_layout(
+            title=dict(text=f'Efficient Frontier & Your CML Target (Live K* = {OPTIMAL_K} Assets)', x=0.5),
+            xaxis_title='Annualized Volatility / Risk (%)',
+            yaxis_title='Annualized Expected Return (%)',
+            height=550,
+            margin=dict(l=20, r=20, t=50, b=20),
+            legend=dict(orientation="h", yanchor="bottom", y=-0.35, xanchor="center", x=0.5)
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+    else:
+        st.info(
+            "📭 **No eligible candidates yet.** The optimizer has nothing to build an efficient frontier from -- "
+            "this means the audited fundamentals store hasn't been synced (or every candidate is currently "
+            "blocked by the Quality/F-Score gate). Go to the 'Multi-Factor Quality & Momentum Scorecard' tab "
+            "and click **🔄 Sync Audited Filings from Screener.in**, then come back here."
+        )
 
     st.markdown("---")
 
-    # FIGURE 4: LIVE OUT-OF-SAMPLE BACKTEST
-    st.markdown("#### Figure 4: Live Out-of-Sample Forward Backtest")
-    st.caption(f"🛡️ **Unbiased Quant Rigor:** In-sample optimization window: **{BACKTEST_TRAIN_START_STR} to {OOS_SPLIT_STR}** | Strict Out-of-Sample Forward Evaluation: **{OOS_SPLIT_STR} to {TODAY_STR}**.")
+    if bt_quant.get('optimal_k', 0) > 0:
+        # FIGURE 4: LIVE OUT-OF-SAMPLE BACKTEST
+        st.markdown("#### Figure 4: Live Out-of-Sample Forward Backtest")
+        st.caption(f"🛡️ **Unbiased Quant Rigor:** In-sample optimization window: **{BACKTEST_TRAIN_START_STR} to {OOS_SPLIT_STR}** | Strict Out-of-Sample Forward Evaluation: **{OOS_SPLIT_STR} to {TODAY_STR}**.")
 
-    test_assets_raw = oos_assets
-    test_bench_raw = oos_bench
-    test_returns = test_assets_raw.pct_change().dropna()
-    # Ensure test_bench_ret is a Series (not DataFrame) for scalar cumprod
-    test_bench_raw_series = test_bench_raw
-    if isinstance(test_bench_raw_series, pd.DataFrame):
-        test_bench_raw_series = test_bench_raw_series.iloc[:, 0] if test_bench_raw_series.shape[1] >= 1 else test_bench_raw_series.mean(axis=1)
-    test_bench_ret = test_bench_raw_series.pct_change().dropna()
-    if isinstance(test_bench_ret, pd.DataFrame):
-        test_bench_ret = test_bench_ret.iloc[:, 0]
+        test_assets_raw = oos_assets
+        test_bench_raw = oos_bench
+        test_returns = test_assets_raw.pct_change().dropna()
+        # Ensure test_bench_ret is a Series (not DataFrame) for scalar cumprod
+        test_bench_raw_series = test_bench_raw
+        if isinstance(test_bench_raw_series, pd.DataFrame):
+            test_bench_raw_series = test_bench_raw_series.iloc[:, 0] if test_bench_raw_series.shape[1] >= 1 else test_bench_raw_series.mean(axis=1)
+        test_bench_ret = test_bench_raw_series.pct_change().dropna()
+        if isinstance(test_bench_ret, pd.DataFrame):
+            test_bench_ret = test_bench_ret.iloc[:, 0]
 
-    t_dates = test_returns.index.intersection(test_bench_ret.index)
-    test_assets_raw = test_assets_raw.loc[t_dates]
-    test_returns = test_returns.loc[t_dates]
-    test_bench_ret = test_bench_ret.loc[t_dates]
+        t_dates = test_returns.index.intersection(test_bench_ret.index)
+        test_assets_raw = test_assets_raw.loc[t_dates]
+        test_returns = test_returns.loc[t_dates]
+        test_bench_ret = test_bench_ret.loc[t_dates]
 
-    w_bt_series = pd.Series(bt_quant['w_optimal'], index=bt_quant['tickers']).reindex(test_assets_raw.columns).fillna(0.0)
-    w_bt_sum = w_bt_series.sum()
-    w_bt_optimal = (w_bt_series / w_bt_sum).values if w_bt_sum > 1e-10 else (np.ones(len(w_bt_series)) / len(w_bt_series))
+        w_bt_series = pd.Series(bt_quant['w_optimal'], index=bt_quant['tickers']).reindex(test_assets_raw.columns).fillna(0.0)
+        w_bt_sum = w_bt_series.sum()
+        w_bt_optimal = (w_bt_series / w_bt_sum).values if w_bt_sum > 1e-10 else (np.ones(len(w_bt_series)) / len(w_bt_series))
 
-    r_dates = test_assets_raw.index.to_series().resample('QE').max().dropna().tolist()
-    rebal_w = pd.Series(index=test_assets_raw.index, dtype='float64')
-    rebal_w.iloc[0] = 1.0
-    cur_h = w_bt_optimal.copy()
+        r_dates = test_assets_raw.index.to_series().resample('QE').max().dropna().tolist()
+        rebal_w = pd.Series(index=test_assets_raw.index, dtype='float64')
+        rebal_w.iloc[0] = 1.0
+        cur_h = w_bt_optimal.copy()
 
-    for i in range(1, len(test_assets_raw)):
-        c_date = test_assets_raw.index[i]
-        d_ratio = (test_assets_raw.iloc[i] / test_assets_raw.iloc[i-1]).values
-        cur_h = cur_h * d_ratio
-        t_val = np.sum(cur_h)
-        rebal_w.iloc[i] = t_val
-        if c_date in r_dates:
-            cur_h = (t_val * 0.999) * w_bt_optimal
+        for i in range(1, len(test_assets_raw)):
+            c_date = test_assets_raw.index[i]
+            d_ratio = (test_assets_raw.iloc[i] / test_assets_raw.iloc[i-1]).values
+            cur_h = cur_h * d_ratio
+            t_val = np.sum(cur_h)
+            rebal_w.iloc[i] = t_val
+            if c_date in r_dates:
+                cur_h = (t_val * 0.999) * w_bt_optimal
 
-    rebal_daily_ret = rebal_w.pct_change().dropna()
-    # Normalize rebal_w to start at 1.0
-    rebal_w_init = rebal_w.iloc[0]
-    if rebal_w_init is not None and rebal_w_init > 1e-10:
-        rebal_w = rebal_w / rebal_w_init
-    daily_rf = (1 + RISK_FREE_RATE)**(1/252) - 1
-    user_strategy_ret = (w_risky * rebal_daily_ret) + (w_safe * daily_rf)
+        rebal_daily_ret = rebal_w.pct_change().dropna()
+        # Normalize rebal_w to start at 1.0
+        rebal_w_init = rebal_w.iloc[0]
+        if rebal_w_init is not None and rebal_w_init > 1e-10:
+            rebal_w = rebal_w / rebal_w_init
+        daily_rf = (1 + RISK_FREE_RATE)**(1/252) - 1
+        user_strategy_ret = (w_risky * rebal_daily_ret) + (w_safe * daily_rf)
 
-    # Use strictly in-sample training covariance for the MVP comparative benchmark (Zero OOS leakage)
-    bt_train_df = master_data['backtest_train_df']
-    valid_train_cols = [c for c in test_assets_raw.columns if c in bt_train_df.columns]
-    if valid_train_cols:
-        lw_in_sample = LedoitWolf().fit(bt_train_df[valid_train_cols])
-        shrunk_cov_in_sample = lw_in_sample.covariance_ * 252
-        bt_K = len(valid_train_cols)
-        bt_init = np.ones(bt_K) / bt_K
-        bt_bounds = tuple((0.0, MAX_RETAIL_CAP) for _ in range(bt_K))
-        bt_cons = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0})
-        bt_mv_res = minimize(lambda w: np.dot(w.T, np.dot(shrunk_cov_in_sample, w)), bt_init, method='SLSQP', bounds=bt_bounds, constraints=bt_cons)
-        mv_weights = bt_mv_res.x if bt_mv_res.success else bt_init
-        mv_oos_returns = test_returns[valid_train_cols].dot(mv_weights)
+        # Use strictly in-sample training covariance for the MVP comparative benchmark (Zero OOS leakage)
+        bt_train_df = master_data['backtest_train_df']
+        valid_train_cols = [c for c in test_assets_raw.columns if c in bt_train_df.columns]
+        if valid_train_cols:
+            lw_in_sample = LedoitWolf().fit(bt_train_df[valid_train_cols])
+            shrunk_cov_in_sample = lw_in_sample.covariance_ * 252
+            bt_K = len(valid_train_cols)
+            bt_init = np.ones(bt_K) / bt_K
+            bt_bounds = tuple((0.0, MAX_RETAIL_CAP) for _ in range(bt_K))
+            bt_cons = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0})
+            bt_mv_res = minimize(lambda w: np.dot(w.T, np.dot(shrunk_cov_in_sample, w)), bt_init, method='SLSQP', bounds=bt_bounds, constraints=bt_cons)
+            mv_weights = bt_mv_res.x if bt_mv_res.success else bt_init
+            mv_oos_returns = test_returns[valid_train_cols].dot(mv_weights)
+        else:
+            mv_oos_returns = test_returns.mean(axis=1)
+
+        strat_col_name = (
+            f'★ Your Personal Strategy (Age {exact_age:.0f} | 🛡️ LDI T={years_to_goal:.1f}Y)'
+            if years_to_goal <= 3.0 else
+            f'★ Your Personal Strategy (Age {exact_age:.0f} CML)'
+        )
+        oos_df = pd.DataFrame({
+            strat_col_name: (1 + user_strategy_ret).cumprod(),
+            'Optimal Multi-Asset (Quarterly Rebalanced)': rebal_w,
+            'Minimum Variance (MVP - Defensive)': (1 + mv_oos_returns).cumprod(),
+            'Nifty 50 Benchmark': (1 + test_bench_ret).cumprod()
+        }).dropna()
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(
+            x=oos_df.index,
+            y=oos_df[strat_col_name],
+            mode='lines',
+            line=dict(color='forestgreen', width=3),
+            name=f'★ Your Personal Strategy ({w_risky*100:.0f}% Risky / {w_safe*100:.0f}% Safe)'
+        ))
+        fig3.add_trace(go.Scatter(
+            x=oos_df.index,
+            y=oos_df['Minimum Variance (MVP - Defensive)'],
+            mode='lines',
+            line=dict(color='royalblue', width=2, dash='dash'),
+            name='Minimum Variance (MVP - Defensive)'
+        ))
+        fig3.add_trace(go.Scatter(
+            x=oos_df.index,
+            y=oos_df['Optimal Multi-Asset (Quarterly Rebalanced)'],
+            mode='lines',
+            line=dict(color='crimson', width=1.5, dash='dot'),
+            name='100% Multi-Asset Engine (Rebalanced)'
+        ))
+        fig3.add_trace(go.Scatter(
+            x=oos_df.index,
+            y=oos_df['Nifty 50 Benchmark'],
+            mode='lines',
+            line=dict(color='black', width=2),
+            name='Nifty 50 Benchmark'
+        ))
+
+        fig3.update_layout(
+            title=dict(text=f'Live Out-of-Sample Forward Backtest ({OOS_SPLIT_STR} to {TODAY_STR})', x=0.5),
+            xaxis_title='Date',
+            yaxis_title='Portfolio Wealth Multiplier (Base = ₹1.0)',
+            height=500,
+            margin=dict(l=20, r=20, t=50, b=20),
+            hovermode='x unified',
+            legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5)
+        )
+        st.plotly_chart(fig3, use_container_width=True)
     else:
-        mv_oos_returns = test_returns.mean(axis=1)
-
-    strat_col_name = (
-        f'★ Your Personal Strategy (Age {exact_age:.0f} | 🛡️ LDI T={years_to_goal:.1f}Y)'
-        if years_to_goal <= 3.0 else
-        f'★ Your Personal Strategy (Age {exact_age:.0f} CML)'
-    )
-    oos_df = pd.DataFrame({
-        strat_col_name: (1 + user_strategy_ret).cumprod(),
-        'Optimal Multi-Asset (Quarterly Rebalanced)': rebal_w,
-        'Minimum Variance (MVP - Defensive)': (1 + mv_oos_returns).cumprod(),
-        'Nifty 50 Benchmark': (1 + test_bench_ret).cumprod()
-    }).dropna()
-
-    fig3 = go.Figure()
-    fig3.add_trace(go.Scatter(
-        x=oos_df.index,
-        y=oos_df[strat_col_name],
-        mode='lines',
-        line=dict(color='forestgreen', width=3),
-        name=f'★ Your Personal Strategy ({w_risky*100:.0f}% Risky / {w_safe*100:.0f}% Safe)'
-    ))
-    fig3.add_trace(go.Scatter(
-        x=oos_df.index,
-        y=oos_df['Minimum Variance (MVP - Defensive)'],
-        mode='lines',
-        line=dict(color='royalblue', width=2, dash='dash'),
-        name='Minimum Variance (MVP - Defensive)'
-    ))
-    fig3.add_trace(go.Scatter(
-        x=oos_df.index,
-        y=oos_df['Optimal Multi-Asset (Quarterly Rebalanced)'],
-        mode='lines',
-        line=dict(color='crimson', width=1.5, dash='dot'),
-        name='100% Multi-Asset Engine (Rebalanced)'
-    ))
-    fig3.add_trace(go.Scatter(
-        x=oos_df.index,
-        y=oos_df['Nifty 50 Benchmark'],
-        mode='lines',
-        line=dict(color='black', width=2),
-        name='Nifty 50 Benchmark'
-    ))
-
-    fig3.update_layout(
-        title=dict(text=f'Live Out-of-Sample Forward Backtest ({OOS_SPLIT_STR} to {TODAY_STR})', x=0.5),
-        xaxis_title='Date',
-        yaxis_title='Portfolio Wealth Multiplier (Base = ₹1.0)',
-        height=500,
-        margin=dict(l=20, r=20, t=50, b=20),
-        hovermode='x unified',
-        legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5)
-    )
-    st.plotly_chart(fig3, use_container_width=True)
+        st.info(
+            "📭 **No eligible candidates in the backtest training window either.** Same root cause as "
+            "Figure 3 above -- sync audited fundamentals first."
+        )
 
 # --- TAB 3: DUPONT & MULTI-FACTOR SCORECARD ---
 with tab_dupont:

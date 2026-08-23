@@ -28,6 +28,7 @@ from quant_engine import (
     _parse_screener_top_ratios,
     _find_statement_row,
     _screener_symbol,
+    solve_portfolio_in_memory,
 )
 
 
@@ -645,3 +646,44 @@ class TestMultifactorRankingsFundamentalsGating:
         assert by_ticker.loc['UNSYNCED.NS', 'Data_Available'] == False
         assert pd.isna(by_ticker.loc['UNSYNCED.NS', 'ROE_Clean'])
         assert pd.isna(by_ticker.loc['UNSYNCED.NS', 'DE_Clean'])
+
+
+class TestSolvePortfolioInMemoryHandlesEmptyCandidatePool:
+    """
+    Regression tests for a real crash a user hit: with the fundamentals dict eliminated, a
+    fresh install (before the first "Sync Audited Filings" run) has zero eligible candidates,
+    which used to reach LedoitWolf().fit() on a zero-column DataFrame and raise
+    'ValueError: at least one array or dtype is required'. This must degrade to a well-defined
+    empty portfolio instead of crashing the app on load.
+    """
+
+    def test_empty_dataframe_returns_empty_portfolio_not_a_crash(self):
+        result = solve_portfolio_in_memory(pd.DataFrame(), mode='Max-Sharpe (Ledoit-Wolf)')
+        assert result['optimal_k'] == 0
+        assert result['tickers'] == []
+        assert result['clean_tickers'] == []
+        assert len(result['w_optimal']) == 0
+        assert result['active_cov_matrix'].shape == (0, 0)
+        assert len(result['active_mean_vector']) == 0
+        assert result['active_returns_df'].empty
+
+    def test_none_returns_df_also_handled(self):
+        result = solve_portfolio_in_memory(None, mode='Max-Sharpe (Ledoit-Wolf)')
+        assert result['optimal_k'] == 0
+
+    @pytest.mark.parametrize("mode", [
+        'Max-Sharpe (Ledoit-Wolf)', 'Minimum Variance Portfolio (MVP)', 'Hierarchical Risk Parity (HRP)',
+    ])
+    def test_every_optimizer_mode_handles_zero_columns(self, mode):
+        zero_col_df = pd.DataFrame(index=pd.date_range('2023-01-01', periods=50))
+        result = solve_portfolio_in_memory(zero_col_df, mode=mode)
+        assert result['optimal_k'] == 0
+        assert len(result['w_optimal']) == 0
+
+    def test_non_empty_input_still_works_after_the_guard(self):
+        # The empty-input guard must not accidentally short-circuit real input.
+        rng = np.random.default_rng(3)
+        returns_df = pd.DataFrame(rng.normal(0.0006, 0.012, (300, 10)), columns=[f'T{i}.NS' for i in range(10)])
+        result = solve_portfolio_in_memory(returns_df, mode='Minimum Variance Portfolio (MVP)')
+        assert result['optimal_k'] > 0
+        assert result['w_optimal'].sum() == pytest.approx(1.0, abs=1e-6)
