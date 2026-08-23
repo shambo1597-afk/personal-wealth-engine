@@ -257,7 +257,7 @@ with progress_placeholder.container():
     p_bar = st.progress(5, text="⚡ Initializing Quantitative Wealth Engine...")
 
 # Stage 1: Master Market Ingestion
-p_bar.progress(20, text="📥 Ingesting Nifty 200 Universe & Sovereign Risk-Free Benchmarks...")
+p_bar.progress(20, text="📥 Ingesting Nifty 500 Universe & Sovereign Risk-Free Benchmarks...")
 master_data = fetch_master_market_data(turbo_mode=turbo_mode)
 
 # Data-vintage disclosure: the price/volume history actually driving today's recommendations
@@ -355,10 +355,10 @@ st.caption(f"Execution Date: **{TODAY.strftime('%d-%B-%Y')}** | Engine: **{opt_m
 
 if OPTIMAL_K == 0:
     st.error(
-        "🔴 **No eligible candidates for fresh capital right now.** Every Nifty 200 constituent is "
+        "🔴 **No eligible candidates for fresh capital right now.** Every Nifty 500 constituent is "
         "either blocked by the Piotroski F-Score Quality Gate or has no audited fundamentals synced "
         "yet -- this is the expected state on a fresh install. Go to the **'Multi-Factor Quality & "
-        "Momentum Scorecard'** tab and click **🔄 Sync Audited Filings from Screener.in**, then rerun. "
+        "Momentum Scorecard'** tab and click **🔄 Sync Audited Structured Financials**, then rerun. "
         "Existing holdings below are unaffected; only new BUY selection is empty."
     )
 
@@ -1390,7 +1390,7 @@ with tab_visuals:
 
 # --- TAB 3: DUPONT & MULTI-FACTOR SCORECARD ---
 with tab_dupont:
-    st.subheader("📊 Multi-Factor Intelligence & DuPont Analytics Hub (Nifty 200 Universe)")
+    st.subheader("📊 Multi-Factor Intelligence & DuPont Analytics Hub (Nifty 500 Universe)")
     st.caption("ℹ️ **Integrated Quantitative Screening Engine:** Combines 90-Day ADTV Liquidity Gate (≥₹10 Cr), 3-Stage DuPont Quality (Margin × Turnover × Leverage), 12M-1M Momentum, 60D Realized Volatility Penalty, and Institutional Volume Accumulation ($Z_{accum}$) with Forensic Governance Circuit Breakers.")
     st.info(
         "💡 **Fundamentals Architecture:** Audited balance sheets, income statements, and cash-flow filings are ingested via "
@@ -1466,7 +1466,7 @@ with tab_dupont:
                 gov_tag = str(rf_row.get('Governance', '🚨 RED FLAG'))
                 st.markdown(f"- **{as_name}** (`{tk}`): **Governance Flag:** `{gov_tag}` | **Sentiment Score:** `{sent_val:+.2f}` | **Trigger:** *{trig}*")
     else:
-        st.success("🟢 **Governance Circuit Breaker Clean:** All 200 Nifty constituents passed NLP sentiment & forensic governance screens with zero active red flags.")
+        st.success("🟢 **Governance Circuit Breaker Clean:** All Nifty 500 constituents passed NLP sentiment & forensic governance screens with zero active red flags.")
 
     st.markdown("---")
 
@@ -1623,7 +1623,7 @@ with tab_dupont:
                 "🔍 Select Constituent for 3-Stage DuPont ROE & Piotroski Deep-Dive:",
                 options=stock_options,
                 index=0,
-                help="Select any Nifty 200 constituent to inspect its DuPont operating margin, asset turnover, leverage, and Piotroski F-Score."
+                help="Select any Nifty 500 constituent to inspect its DuPont operating margin, asset turnover, leverage, and Piotroski F-Score."
             )
 
         selected_row = multifactor_scorecard_df[multifactor_scorecard_df['Asset'] == selected_asset].iloc[0]

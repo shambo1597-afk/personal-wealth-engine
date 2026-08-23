@@ -270,7 +270,7 @@ MULTI_ASSET_EXCHANGE_INSTRUMENTS = {
 
 @st.cache_data(ttl=604800, show_spinner=False)
 def fetch_live_nifty_universe(
-    index_code: str = 'nifty200', turbo_mode: bool = False
+    index_code: str = 'nifty500', turbo_mode: bool = False
 ) -> Tuple[List[str], Dict[str, str], bool]:
     """
     Downloads the official live constituents and industry classifications directly from NiftyIndices / nselib / NSE,
@@ -317,7 +317,7 @@ def fetch_live_nifty_universe(
     except Exception:
         pass
 
-    # 2. Secondary: Direct nselib capital market lists (Nifty 50 + Nifty Next 50 + Midcap 150)
+    # 2. Secondary: Direct nselib capital market lists (Nifty 50 + Nifty Next 50 + Midcap 150 + Smallcap 250)
     if NSELIB_AVAILABLE and nse_cm is not None:
         try:
             dfs = []
@@ -331,6 +331,11 @@ def fetch_live_nifty_universe(
                 pass
             try:
                 dfs.append(nse_cm.niftymidcap150_equity_list())
+            except Exception:
+                pass
+            try:
+                if hasattr(nse_cm, 'niftysmallcap250_equity_list'):
+                    dfs.append(nse_cm.niftysmallcap250_equity_list())
             except Exception:
                 pass
             if dfs:
@@ -2183,9 +2188,9 @@ def fetch_master_market_data(
     horizons = get_market_time_horizons()
     if universe_tickers:
         tickers_list = list(universe_tickers)
-        _, live_sector_map, _ = fetch_live_nifty_universe('nifty200', turbo_mode=turbo_mode)
+        _, live_sector_map, _ = fetch_live_nifty_universe('nifty500', turbo_mode=turbo_mode)
     else:
-        live_tickers, live_sector_map, _ = fetch_live_nifty_universe('nifty200', turbo_mode=turbo_mode)
+        live_tickers, live_sector_map, _ = fetch_live_nifty_universe('nifty500', turbo_mode=turbo_mode)
         tickers_list = live_tickers
 
     bench_tk = benchmark_ticker or BENCHMARK_TICKER
