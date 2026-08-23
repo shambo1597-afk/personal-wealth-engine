@@ -3,6 +3,8 @@
 # Section 112A LTCG, Section 111A STCG, Section 50AA Debt, and Section 70/74 Set-off Mechanics
 # ====================================================================================================
 
+from typing import Any, Dict, Optional, Union
+
 import pandas as pd
 import numpy as np
 from config import SOVEREIGN_BOND_TICKER, get_market_time_horizons, HEALTH_AND_EDUCATION_CESS
@@ -23,7 +25,12 @@ SEC_112A_EXEMPTION_LIMIT  = 125000.0   # ₹1,25,000 Annual Tax-Free LTCG Exempt
 # ----------------------------------------------------------------------------------------------------
 # 1.1 SECTION 112A / SECTION 55(2)(ac) PRE-2018 GRANDFATHERING ENGINE
 # ----------------------------------------------------------------------------------------------------
-def compute_grandfathered_cost_basis(buy_date, buy_price, sale_or_live_price, fmv_31jan2018=None):
+def compute_grandfathered_cost_basis(
+    buy_date: Any,
+    buy_price: float,
+    sale_or_live_price: float,
+    fmv_31jan2018: Optional[float] = None,
+) -> float:
     """
     Computes the deemed cost of acquisition under Section 55(2)(ac) of the Income Tax Act, 1961:
     For equity shares and equity-oriented mutual funds acquired before 1st February 2018 (buy_date < '2018-02-01'):
@@ -51,7 +58,7 @@ def compute_grandfathered_cost_basis(buy_date, buy_price, sale_or_live_price, fm
 # ----------------------------------------------------------------------------------------------------
 # 2. REALIZED CAPITAL GAINS & SECTION 70/74 INTRA-HEAD SET-OFF ENGINE
 # ----------------------------------------------------------------------------------------------------
-def compute_realized_tax_summary(fy_sells_df):
+def compute_realized_tax_summary(fy_sells_df: Optional[pd.DataFrame]) -> Dict[str, float]:
     """
     Computes realized capital gains and enforces statutory Section 70 & 74 intra-head loss set-off rules:
       - Applies Section 55(2)(ac) pre-2018 grandfathering for eligible Section 112A LTCG trades.
@@ -201,7 +208,11 @@ def compute_realized_tax_summary(fy_sells_df):
 # ----------------------------------------------------------------------------------------------------
 # 3. UNREALIZED TAX-LOSS & QUALIFIED LTCG PROFIT HARVESTING
 # ----------------------------------------------------------------------------------------------------
-def compute_unrealized_tax_lots_analysis(tax_lots_df, latest_prices_series, current_date=None):
+def compute_unrealized_tax_lots_analysis(
+    tax_lots_df: Optional[pd.DataFrame],
+    latest_prices_series: Union[pd.Series, Dict[str, float], None],
+    current_date: Optional[Any] = None,
+) -> Dict[str, Any]:
     """
     Analyzes active tax lots to identify:
       1. Qualified Section 112A LTCG profits (Equity/Gold holding period >= 365 days, unrealized gain > 0).
@@ -302,7 +313,7 @@ def compute_unrealized_tax_lots_analysis(tax_lots_df, latest_prices_series, curr
 # ----------------------------------------------------------------------------------------------------
 # 4. SCHEDULE 112A / SCHEDULE CG TAX EXPORT BUILDER
 # ----------------------------------------------------------------------------------------------------
-def build_schedule_112a_records(filtered_sells):
+def build_schedule_112a_records(filtered_sells: Optional[pd.DataFrame]) -> pd.DataFrame:
     """
     Formats sell trade ledger records into ITR-2 / ITR-3 Schedule 112A / Schedule CG tax audit structure.
     Enforces Section 48 non-deductibility of Securities Transaction Tax (STT).
@@ -369,7 +380,10 @@ def build_schedule_112a_records(filtered_sells):
 # ----------------------------------------------------------------------------------------------------
 # 5. ACTIVE TAX-LOSS NEUTRALIZER (AUTOMATED HARVESTING RECOMMENDER)
 # ----------------------------------------------------------------------------------------------------
-def recommend_tax_loss_harvesting_trades(tax_summary, unrealized_tax_analysis):
+def recommend_tax_loss_harvesting_trades(
+    tax_summary: Optional[Dict[str, float]],
+    unrealized_tax_analysis: Optional[Dict[str, Any]],
+) -> pd.DataFrame:
     """
     Automated Active Tax-Loss Neutralizer Algorithm:
     Calculates the exact number of shares to harvest from loss positions to neutralize realized
@@ -397,7 +411,7 @@ def recommend_tax_loss_harvesting_trades(tax_summary, unrealized_tax_analysis):
         return pd.DataFrame(columns=cols)
 
     # Prioritize STCG / Debt losses (<365 days / Sec 50AA) first since STCL can offset Debt STCG @ 31.2% and Equity STCG @ 20.8%, then LTCG losses
-    def _sort_loss_rows(r):
+    def _sort_loss_rows(r: Dict[str, Any]):
         cat = str(r.get('Loss Category', ''))
         if 'STCG' in cat or 'Debt' in cat or '50AA' in cat:
             cat_rank = 0
