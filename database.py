@@ -539,9 +539,9 @@ def parse_and_import_broker_csv(file_bytes, conn, mode='Merge New Trades (Increm
                                 break
                             if lot['quantity'] > 1e-6:
                                 deduct = min(lot['quantity'], sell_rem)
-                                lot['quantity'] -= deduct
-                                sell_rem -= deduct
-                                
+                                lot['quantity'] = round(lot['quantity'] - deduct, 4)
+                                sell_rem = round(sell_rem - deduct, 4)
+
                                 b_price = float(lot['buy_price'])
                                 b_date = lot['buy_date']
                                 matched_pnl = round((sell_price - b_price) * deduct, 2)
@@ -657,8 +657,8 @@ def parse_and_import_broker_csv(file_bytes, conn, mode='Merge New Trades (Increm
                                 break
                             if lot['quantity'] > 1e-6:
                                 deduct = min(lot['quantity'], sell_rem)
-                                lot['quantity'] -= deduct
-                                sell_rem -= deduct
+                                lot['quantity'] = round(lot['quantity'] - deduct, 4)
+                                sell_rem = round(sell_rem - deduct, 4)
 
                                 b_price = float(lot['buy_price'])
                                 b_date = lot['buy_date']

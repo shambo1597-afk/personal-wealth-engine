@@ -785,9 +785,19 @@ def solve_portfolio_in_memory(
             p_vol = float(np.sqrt(max(var, 1e-8)))
             return -(p_ret - rf) / p_vol
 
+        def max_sharpe_gradient(w):
+            # Analytical Jacobian of f(w) = -(w.mu - rf) / sqrt(w'Sigma w):
+            #   df/dw = -mu/sigma + (w.mu - rf) * (Sigma w) / sigma^3
+            p_ret = float(np.sum(w * mean_ret_arr))
+            excess = p_ret - rf
+            var = float(np.dot(w.T, np.dot(shrunk_cov, w)))
+            sigma = float(np.sqrt(max(var, 1e-8)))
+            sigma_w = np.dot(shrunk_cov, w)
+            return -mean_ret_arr / sigma + excess * sigma_w / (sigma ** 3)
+
         opt_res = minimize(
             max_sharpe_objective, init_guess, method='SLSQP',
-            bounds=bounds, constraints=constraints,
+            jac=max_sharpe_gradient, bounds=bounds, constraints=constraints,
             options={'maxiter': 200, 'ftol': 1e-7}
         )
 
