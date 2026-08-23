@@ -34,6 +34,7 @@ from quant_engine import (
     fetch_fundamental_scorecard, fetch_live_indian_risk_free_rate, compute_vectorized_monte_carlo_frontier,
     analyze_ticker_sentiment, compute_news_sentiment_for_universe,
     compute_lifecycle_asset_allocation,
+    sync_screener_fundamentals_for_universe, get_fundamentals_last_synced,
     SECTOR_MAP, get_asset_sector
 )
 from tax_engine import (
@@ -387,29 +388,37 @@ target_safe_wealth  = total_portfolio_wealth * w_safe
 drift_tolerance_pct = 25 if total_available_broker_cash > 0 else 20
 tolerance_decimal = drift_tolerance_pct / 100.0
 
-# Build universe Piotroski F-Score & Institutional Inflow lookup maps for Tab 1 & Tab 3
+# Build universe Piotroski F-Score & Institutional Inflow lookup maps for Tab 1 & Tab 3.
+# 'safe' is the actual buy-gate decision: True only for a real F-Score > 3, or a Financial
+# Institution the score is explicitly exempted for -- missing/failed/unsynced data is UNSAFE
+# (blocks fresh capital) by default, never a silent neutral pass.
+_UNSYNCED_F_INFO = {'score': None, 'badge': '⚪ Not Yet Synced', 'display': 'N/A', 'safe': False, 'source': 'Not Yet Synced'}
+
+def _f_info_from_row(row) -> dict:
+    raw_score = row.get('piotroski_f_score', row.get('Piotroski_F_Score', row.get('f_score_num')))
+    score = None if pd.isna(raw_score) else int(raw_score)
+    source = str(row.get('Data Source', row.get('Fundamentals Source', 'Not Yet Synced')))
+    is_exempt_financial = (source == 'Not Applicable (Financial Institution)')
+    return {
+        'score': score,
+        'badge': str(row.get('piotroski_badge', row.get('f_score_label', row.get('F_Score_Label', '⚪ Not Yet Synced')))),
+        'display': str(row.get('Piotroski F-Score', row.get('f_score_display', row.get('Piotroski_Score', 'N/A')))),
+        'safe': is_exempt_financial or (score is not None and score > 3),
+        'source': source,
+    }
+
 f_score_lookup = {}
 if universe_fundamentals is not None and not universe_fundamentals.empty and 'Ticker' in universe_fundamentals.columns:
     for _, f_row in universe_fundamentals.iterrows():
-        tk = f_row['Ticker']
-        f_score_lookup[tk] = {
-            'score': int(f_row.get('piotroski_f_score', f_row.get('f_score_num', 7))),
-            'badge': str(f_row.get('piotroski_badge', f_row.get('f_score_label', '🔵 Moderate (5-7/9)'))),
-            'display': str(f_row.get('Piotroski F-Score', f_row.get('f_score_display', '7/9')))
-        }
+        f_score_lookup[f_row['Ticker']] = _f_info_from_row(f_row)
 
 inflow_lookup = {}
 if not multifactor_scorecard_df.empty and 'Ticker' in multifactor_scorecard_df.columns:
     for _, sc_row in multifactor_scorecard_df.iterrows():
         tk = sc_row['Ticker']
         if tk not in f_score_lookup:
-            sc_sc = int(sc_row.get('piotroski_f_score', sc_row.get('Piotroski_F_Score', 7)))
-            f_score_lookup[tk] = {
-                'score': sc_sc,
-                'badge': str(sc_row.get('piotroski_badge', sc_row.get('F_Score_Label', '🔵 Moderate (5-7/9)'))),
-                'display': str(sc_row.get('Piotroski F-Score', sc_row.get('Piotroski_Score', f"{sc_sc}/9 ★" if sc_sc >= 8 else f"{sc_sc}/9")))
-            }
-        
+            f_score_lookup[tk] = _f_info_from_row(sc_row)
+
         ratio_val = float(sc_row.get('Accumulation_Ratio', sc_row.get('Vol_Accum_Ratio', 1.0)))
         badge_val = str(sc_row.get('Institutional Inflow', sc_row.get('Institutional_Inflow_Badge', '⚪ Neutral Flow')))
         inflow_lookup[tk] = {'ratio': ratio_val, 'badge': badge_val}
@@ -446,7 +455,7 @@ for t in all_relevant_tickers:
     red_trigger = triggers.get(t, '')
     
     # Piotroski F-Score Information
-    f_info = f_score_lookup.get(t, {'score': 7, 'badge': '🔵 Moderate (5-7/9)', 'display': '7/9'})
+    f_info = f_score_lookup.get(t, _UNSYNCED_F_INFO)
     f_sc = f_info['score']
     f_badge = f_info['badge']
     f_disp = f_info['display']
@@ -460,9 +469,13 @@ for t in all_relevant_tickers:
     if is_red_flag:
         init_action = "🔴 NEWS CIRCUIT BREAKER (GOVERNANCE ALERT)"
         init_rationale = f"Governance Alert: {red_trigger}" if red_trigger else "High-Risk News Catalyst / Regulatory Flag"
-    elif f_sc <= 3:
-        init_action = "⛔ F-SCORE DETERIORATING (BUY BLOCKED)"
-        init_rationale = f"F-Score: {f_disp} ({f_badge}) — Balance Sheet Deteriorating (Buy Blocked)"
+    elif not f_info['safe']:
+        init_action = "⛔ FUNDAMENTALS NOT SYNCED (BUY BLOCKED)" if f_sc is None else "⛔ F-SCORE DETERIORATING (BUY BLOCKED)"
+        init_rationale = (
+            "No audited Screener.in fundamentals synced for this ticker — Buy Blocked pending sync"
+            if f_sc is None else
+            f"F-Score: {f_disp} ({f_badge}) — Balance Sheet Deteriorating (Buy Blocked)"
+        )
     elif t_weight > 0:
         init_action = '⚪ HOLD'
         if inflow_ratio >= 2.0:
@@ -508,7 +521,7 @@ for t in order_tbl.index:
     curr_val = order_tbl.loc[t, 'Current Value (₹)']
     q_total = order_tbl.loc[t, 'Shares Owned']
     q_ltcg = order_tbl.loc[t, 'LTCG Shares']
-    f_info = f_score_lookup.get(t, {'score': 7, 'badge': '🔵 Moderate (5-7/9)', 'display': '7/9'})
+    f_info = f_score_lookup.get(t, _UNSYNCED_F_INFO)
     f_disp = f_info['display']
     if p <= 0: continue
         
@@ -589,7 +602,7 @@ for t in pass1_priority_order:
     sma_val = order_tbl.loc[t, 'SMA-200 (₹)']
     is_red_flag = (gov_flags.get(t) == 'RED_FLAG')
     red_trigger = triggers.get(t, '')
-    f_info = f_score_lookup.get(t, {'score': 7, 'badge': '🔵 Moderate (5-7/9)', 'display': '7/9'})
+    f_info = f_score_lookup.get(t, _UNSYNCED_F_INFO)
     f_sc = f_info['score']
     f_badge = f_info['badge']
     f_disp = f_info['display']
@@ -602,12 +615,19 @@ for t in pass1_priority_order:
             order_tbl.loc[t, 'Quantitative Rationale'] = f"Governance Alert: {red_trigger}" if red_trigger else "High-Risk News Catalyst / Regulatory Flag"
         continue
 
-    # Piotroski F-Score Safety Gate: Block new BUY allocations if F-Score <= 3
-    if f_sc <= 3:
+    # Piotroski F-Score Safety Gate: Block new BUY allocations if F-Score <= 3, OR if there is
+    # no verified audited data at all (never a silent neutral pass for missing/failed sync).
+    # Financial Institutions are explicitly exempted (f_info['safe']=True) since the 9-point
+    # score doesn't apply to them -- see FINANCIAL_SECTOR_NAMES in quant_engine.py.
+    if not f_info['safe']:
         order_tbl.loc[t, 'Shares to Buy'] = 0
         if gap > 0 or order_tbl.loc[t, 'Shares Owned'] > 0:
-            order_tbl.loc[t, 'Action'] = "⛔ F-SCORE DETERIORATING (BUY BLOCKED)"
-            order_tbl.loc[t, 'Quantitative Rationale'] = f"F-Score Decay ({f_disp} — {f_badge}) | Decaying Balance Sheet — Fresh Capital Blocked"
+            if f_sc is None:
+                order_tbl.loc[t, 'Action'] = "⛔ FUNDAMENTALS NOT SYNCED (BUY BLOCKED)"
+                order_tbl.loc[t, 'Quantitative Rationale'] = "No audited Screener.in fundamentals synced for this ticker — Fresh Capital Blocked pending sync"
+            else:
+                order_tbl.loc[t, 'Action'] = "⛔ F-SCORE DETERIORATING (BUY BLOCKED)"
+                order_tbl.loc[t, 'Quantitative Rationale'] = f"F-Score Decay ({f_disp} — {f_badge}) | Decaying Balance Sheet — Fresh Capital Blocked"
         continue
 
     # 200-DMA Binary Trend Filter: Block new BUY allocations if Live Price < SMA_200
@@ -631,7 +651,7 @@ while cash_pool > 0:
     eligible_mask = (
         (order_tbl['Target Value (₹)'] > 0) & 
         (order_tbl.index.map(lambda sym: gov_flags.get(sym, 'NORMAL') != 'RED_FLAG')) &
-        (order_tbl.index.map(lambda sym: f_score_lookup.get(sym, {}).get('score', 7) > 3)) &
+        (order_tbl.index.map(lambda sym: f_score_lookup.get(sym, _UNSYNCED_F_INFO)['safe'])) &
         ((order_tbl['Live Price (₹)'] >= order_tbl['SMA-200 (₹)']) | order_tbl['SMA-200 (₹)'].isna()) &
         (order_tbl['Live Price (₹)'] > 0)
     )
@@ -666,7 +686,7 @@ while cash_pool > 0:
 for t in order_tbl.index:
     b = int(order_tbl.loc[t, 'Shares to Buy'])
     if b > 0:
-        f_info = f_score_lookup.get(t, {'score': 7, 'badge': '🔵 Moderate (5-7/9)', 'display': '7/9'})
+        f_info = f_score_lookup.get(t, _UNSYNCED_F_INFO)
         order_tbl.loc[t, 'Action'] = f"🟢 BUY {b} Share(s)"
         order_tbl.loc[t, 'Quantitative Rationale'] = f"F-Score: {f_info['display']} ({f_info['badge']}) | Gap: ₹{order_tbl.loc[t, 'Mathematical Gap (₹)']:,.0f} | 200-DMA Uptrend"
 
@@ -936,10 +956,12 @@ with tab_ticket:
         st.info("💡 **Tax-Free Cash Rebalancing Active:** Fresh cash is automatically routed to underweight assets to restore optimal tangency with zero sell friction.")
     st.info("💡 **Instructions for Zerodha / Groww:** Place Delivery (CNC) Market Orders for the 🟢 BUY signals below, then click '💾 Commit Trades to SQLite Database' in the sidebar to lock your ledger.")
     st.warning(
-        "⚠️ **Before you place any order:** the Piotroski F-Score gate behind these BUY/BLOCK decisions runs on "
-        "a static fundamentals snapshot, not live filings (see the 'Multi-Factor Quality & Momentum Scorecard' "
-        "tab → **Fundamentals Source** column for which stocks are hand-curated vs. sector-average estimates). "
-        "Cross-check any position's real financials before you act on it."
+        "⚠️ **Before you place any order:** the Piotroski F-Score gate now runs on audited financials "
+        "extracted from Screener.in (see the 'Multi-Factor Quality & Momentum Scorecard' tab → **🔄 Sync "
+        "Audited Filings** and the **Fundamentals Source** column), but this extraction has never been "
+        "verified against a live Screener.in page -- run a sync yourself and spot-check a few tickers' "
+        "numbers in your browser before trusting a single order below. A ⛔ **FUNDAMENTALS NOT SYNCED** "
+        "action means this ticker has no verified data at all and is blocked until you sync."
     )
     
     with st.expander("⚡ 1-Click Zerodha Kite Basket Order Exporter", expanded=False):
@@ -1310,13 +1332,81 @@ with tab_dupont:
     st.subheader("📊 Multi-Factor Intelligence & DuPont Analytics Hub (Nifty 200 Universe)")
     st.caption("ℹ️ **Integrated Quantitative Screening Engine:** Combines 90-Day ADTV Liquidity Gate (≥₹10 Cr), 3-Stage DuPont Quality (Margin × Turnover × Leverage), 12M-1M Momentum, 60D Realized Volatility Penalty, and Institutional Volume Accumulation ($Z_{accum}$) with Forensic Governance Circuit Breakers.")
     st.warning(
-        "⚠️ **Fundamentals Data Provenance:** DuPont ROE, Net Margin, Debt/Equity, and Piotroski F-Score inputs "
-        "below are **not fetched live from filings**. Large-caps use a hand-curated snapshot baked into the "
-        "code (`CALIBRATED_CONSTITUENT_FUNDAMENTALS` in `quant_engine.py`, undated); everything else falls back "
-        "to a **sector-average estimate**, not that company's actual financials. Before trusting the Piotroski "
-        "F-Score ≤3 buy-block on any specific position, verify the underlying numbers yourself against the "
-        "company's latest quarterly/annual filing (e.g. on screener.in or the exchange's disclosures)."
+        "⚠️ **Fundamentals Data Provenance:** DuPont ROE, Net Margin, Debt/Equity, and the Piotroski F-Score "
+        "are extracted from Screener.in's audited financial-statement tables (Profit & Loss, Balance Sheet, "
+        "Cash Flow) via the sync below -- not a static in-code snapshot any more. That said, **this scraper has "
+        "never been run against a live Screener.in page during development** (the environment it was built in "
+        "blocks that site); before trusting a specific position's F-Score gate, sync and then spot-check its "
+        "numbers against the actual screener.in page in your browser. A ticker with **Fundamentals Source = "
+        "'Sync Failed'** means the parser didn't recognize that page's layout -- treat that as blocked, not "
+        "as a passing score. Banks/NBFCs show **'Not Applicable (Financial Institution)'**: the 9-point "
+        "Piotroski test doesn't transfer to their statement structure, so only ROE/D-E are shown for them."
     )
+
+    # -------------------------------------------------------------------------
+    # 0. AUDITED FILINGS SYNC -- the only way the fundamentals store gets populated or refreshed
+    # -------------------------------------------------------------------------
+    _last_synced = get_fundamentals_last_synced()
+    sync_col1, sync_col2 = st.columns([1, 2])
+    with sync_col1:
+        sync_clicked = st.button("🔄 Sync Audited Filings from Screener.in", type="primary", use_container_width=True)
+    with sync_col2:
+        if _last_synced:
+            st.caption(f"🕒 **Last Synced:** `{_last_synced}`")
+        else:
+            st.caption("🔴 **Never synced** — the Piotroski/DuPont Quality Gate has no data yet and will block all fresh BUY allocations until you sync.")
+
+    # A prior sync's summary survives the st.rerun() below via session_state, so the user
+    # actually gets to see the result instead of it being wiped by the immediate rerun.
+    _last_sync_summary = st.session_state.get('last_screener_sync_summary')
+    if _last_sync_summary:
+        st.success(_last_sync_summary['message'])
+        if _last_sync_summary.get('failed_rows'):
+            with st.expander(f"⛔ {len(_last_sync_summary['failed_rows'])} tickers failed to sync last run — click to see why"):
+                st.dataframe(pd.DataFrame(_last_sync_summary['failed_rows']), hide_index=True, use_container_width=True)
+        if _last_sync_summary.get('mostly_failed'):
+            st.error(
+                "🔴 **Over half of all tickers failed to sync.** This almost certainly means the "
+                "scraper's assumptions about Screener.in's page layout are wrong (site redesign, "
+                "anti-bot page, or a changed URL structure) rather than 200 individual failures -- "
+                "do not trust any 'Screener.in (Audited)' rows from this run until that's fixed."
+            )
+        del st.session_state['last_screener_sync_summary']  # show it exactly once
+
+    if sync_clicked:
+        # The full Nifty 200 + multi-asset candidate universe -- NOT `tickers` (the optimizer's
+        # already-selected top-N), since syncing must cover the whole pool the screen picks from.
+        _full_universe = list(live_sector_map.keys()) if live_sector_map else list(multifactor_scorecard_df['Ticker']) if not multifactor_scorecard_df.empty else tickers
+        sync_universe = list(dict.fromkeys(list(_full_universe) + owned_tickers + [SOVEREIGN_BOND_TICKER]))
+        sync_progress = st.progress(0, text="Starting Screener.in sync...")
+
+        def _on_sync_progress(done: int, total: int, current_ticker: str) -> None:
+            sync_progress.progress(done / total, text=f"Syncing {current_ticker} ({done}/{total})...")
+
+        with st.spinner("Fetching audited filings from Screener.in — this is deliberately rate-limited and will take several minutes for the full universe..."):
+            synced_df = sync_screener_fundamentals_for_universe(
+                sync_universe, sector_map=SECTOR_MAP, progress_callback=_on_sync_progress
+            )
+        sync_progress.progress(1.0, text="Sync complete.")
+
+        if not synced_df.empty:
+            n_ok = int((synced_df['Data Source'] == 'Screener.in (Audited)').sum())
+            n_na_fin = int((synced_df['Data Source'] == 'Not Applicable (Financial Institution)').sum())
+            n_failed = int((synced_df['Data Source'] == 'Sync Failed').sum())
+            failed_rows = (
+                synced_df[synced_df['Data Source'] == 'Sync Failed'][['Ticker', 'sync_error']].to_dict('records')
+                if n_failed > 0 else []
+            )
+            st.session_state['last_screener_sync_summary'] = {
+                'message': (
+                    f"✅ Synced {len(synced_df)} tickers: **{n_ok} audited**, **{n_na_fin} financial institutions "
+                    f"(F-Score N/A)**, **{n_failed} failed**."
+                ),
+                'failed_rows': failed_rows,
+                'mostly_failed': n_failed > len(synced_df) * 0.5,
+            }
+        st.cache_data.clear()
+        st.rerun()
 
     # -------------------------------------------------------------------------
     # 1. GOVERNANCE & RED-FLAG CIRCUIT BREAKER ALERT BANNER
@@ -1510,62 +1600,64 @@ with tab_dupont:
         selected_row = multifactor_scorecard_df[multifactor_scorecard_df['Asset'] == selected_asset].iloc[0]
         sel_ticker = selected_row['Ticker']
 
-        # Extract DuPont & Piotroski metrics from universe_fundamentals or scorecard
-        npm_val = float(selected_row.get('NPM_Clean', 15.0))
-        de_val = float(selected_row.get('DE_Clean', 0.40))
-        roe_val = float(selected_row.get('ROE_Clean', 16.0))
-        accum_ratio_val = float(selected_row.get('Accumulation_Ratio', selected_row.get('Vol_Accum_Ratio', 1.0)))
+        # Extract DuPont & Piotroski metrics from universe_fundamentals or scorecard. None/NaN
+        # is preserved as None throughout -- never silently defaulted to a plausible-looking
+        # number -- since this panel exists specifically to let you audit what's driving the
+        # buy/block decision.
+        def _num_or_none(v):
+            return float(v) if pd.notna(v) else None
+
+        npm_val = _num_or_none(selected_row.get('NPM_Clean'))
+        de_val = _num_or_none(selected_row.get('DE_Clean'))
+        roe_val = _num_or_none(selected_row.get('ROE_Clean'))
+        accum_ratio_val = _num_or_none(selected_row.get('Accumulation_Ratio', selected_row.get('Vol_Accum_Ratio', 1.0))) or 1.0
         inflow_badge_val = str(selected_row.get('Institutional Inflow', selected_row.get('Institutional_Inflow_Badge', '⚪ Neutral Flow')))
-        
+
         fund_row = universe_fundamentals[universe_fundamentals['Ticker'] == sel_ticker].iloc[0] if (universe_fundamentals is not None and not universe_fundamentals.empty and sel_ticker in universe_fundamentals['Ticker'].values) else None
-        
-        if fund_row is not None:
-            turnover_val = float(fund_row.get('turnover_num', 0.75))
-            leverage_val = float(fund_row.get('leverage_num', 1.65))
-            pe_val = float(fund_row.get('pe_num', 25.0))
-            health_val = str(fund_row.get('Fundamental Health', selected_row.get('Fundamental Health', '✅ High Quality (Solvent)')))
-            f_score_val = int(fund_row.get('piotroski_f_score', fund_row.get('f_score_num', 7)))
-            f_badge_val = str(fund_row.get('piotroski_badge', fund_row.get('f_score_label', '🔵 Moderate (5-7/9)')))
-            f_disp_val = str(fund_row.get('Piotroski F-Score', fund_row.get('f_score_display', f"{f_score_val}/9 ★" if f_score_val >= 8 else f"{f_score_val}/9")))
-            data_source_val = str(fund_row.get('Data Source', selected_row.get('Fundamentals Source', 'Sector-Average Estimate')))
-        else:
-            turnover_val = float(selected_row.get('turnover_num', 0.75))
-            leverage_val = float(selected_row.get('leverage_num', 1.0 + de_val))
-            pe_val = float(selected_row.get('pe_num', 25.0))
-            health_val = str(selected_row.get('Fundamental Health', '✅ High Quality (Solvent)'))
-            f_score_val = int(selected_row.get('piotroski_f_score', selected_row.get('Piotroski_F_Score', 7)))
-            f_badge_val = str(selected_row.get('piotroski_badge', selected_row.get('F_Score_Label', '🔵 Moderate (5-7/9)')))
-            f_disp_val = str(selected_row.get('Piotroski F-Score', selected_row.get('Piotroski_Score', f"{f_score_val}/9 ★" if f_score_val >= 8 else f"{f_score_val}/9")))
-            data_source_val = str(selected_row.get('Fundamentals Source', 'Sector-Average Estimate'))
+        source_row = fund_row if fund_row is not None else selected_row
+
+        turnover_val = _num_or_none(source_row.get('turnover_num'))
+        leverage_val = _num_or_none(source_row.get('leverage_num'))
+        pe_val = _num_or_none(source_row.get('pe_num'))
+        health_val = str(source_row.get('Fundamental Health', '⚪ Not Yet Synced'))
+        f_score_raw = source_row.get('piotroski_f_score', source_row.get('f_score_num', source_row.get('Piotroski_F_Score')))
+        f_score_val = None if pd.isna(f_score_raw) else int(f_score_raw)
+        f_badge_val = str(source_row.get('piotroski_badge', source_row.get('f_score_label', source_row.get('F_Score_Label', '⚪ Not Yet Synced'))))
+        f_disp_val = str(source_row.get('Piotroski F-Score', source_row.get('f_score_display', 'N/A')))
+        data_source_val = str(source_row.get('Data Source', source_row.get('Fundamentals Source', 'Not Yet Synced')))
 
         with st.container(border=True):
             st.markdown(f"##### 🏢 **{selected_asset}** (`{sel_ticker}`) — DuPont 3-Stage & Piotroski Breakdown")
-            if data_source_val == 'Calibrated Snapshot':
-                st.caption("📌 **Fundamentals Source: Calibrated Snapshot** — a hand-curated, undated figure baked into the code, not a live filing. Verify against the company's latest quarterly/annual report before trusting the F-Score gate.")
+            if data_source_val == 'Screener.in (Audited)':
+                st.caption("📌 **Fundamentals Source: Screener.in (Audited)** — extracted from this company's own audited P&L/Balance Sheet/Cash Flow tables. This scraper is unverified against a live page (see the Tab 3 banner above) -- spot-check these numbers in your browser before trusting them.")
+            elif data_source_val == 'Not Applicable (Financial Institution)':
+                st.caption("🏦 **Fundamentals Source: Not Applicable (Financial Institution)** — the 9-point Piotroski F-Score doesn't transfer to bank/NBFC statement structures, so it's intentionally not computed here. DuPont ROE/D-E above remain real, audited figures.")
+            elif data_source_val == 'Sync Failed':
+                st.caption("⛔ **Fundamentals Source: Sync Failed** — the scraper could not parse this ticker's Screener.in page. Treat every number below as unavailable, not as a passing score.")
             else:
-                st.caption("📊 **Fundamentals Source: Sector-Average Estimate** — this ticker has no company-specific snapshot; the numbers below reflect its *sector's* average, not its own balance sheet. Verify independently before trusting the F-Score gate.")
+                st.caption("⚪ **Fundamentals Source: Not Yet Synced** — click '🔄 Sync Audited Filings' above to fetch this ticker's real financials. Fresh capital allocation is blocked until then.")
             st.latex(r"\text{DuPont ROE} = \underbrace{\left(\frac{\text{Net Income}}{\text{Revenue}}\right)}_{\text{Net Profit Margin}} \times \underbrace{\left(\frac{\text{Revenue}}{\text{Total Assets}}\right)}_{\text{Asset Turnover}} \times \underbrace{\left(\frac{\text{Total Assets}}{\text{Total Equity}}\right)}_{\text{Financial Leverage}}")
-            
+
             d_c1, d_c2, d_c3, d_c4, d_c5, d_c6 = st.columns(6)
             with d_c1:
                 st.metric(
                     "1. Net Margin (%)",
-                    f"{npm_val:.1f}%",
+                    f"{npm_val:.1f}%" if npm_val is not None else "N/A",
                     help="Operating Efficiency: Percentage of revenue converted into bottom-line net profit."
                 )
                 st.caption("*(Operating Efficiency)*")
             with d_c2:
                 st.metric(
                     "2. Asset Turnover (x)",
-                    f"{turnover_val:.2f}x",
+                    f"{turnover_val:.2f}x" if turnover_val is not None else "N/A",
                     help="Asset Utilization: Revenue generated per unit of total assets deployed."
                 )
                 st.caption("*(Asset Utilization)*")
             with d_c3:
                 st.metric(
                     "3. Financial Leverage",
-                    f"{leverage_val:.2f}x",
-                    f"D/E: {de_val:.2f}x",
+                    f"{leverage_val:.2f}x" if leverage_val is not None else "N/A",
+                    f"D/E: {de_val:.2f}x" if de_val is not None else "D/E: N/A",
                     delta_color="off",
                     help="Capital Structure: Total assets divided by shareholders' equity."
                 )
@@ -1573,9 +1665,9 @@ with tab_dupont:
             with d_c4:
                 st.metric(
                     "= 3-Stage DuPont ROE",
-                    f"{roe_val:.1f}%",
+                    f"{roe_val:.1f}%" if roe_val is not None else "N/A",
                     f"Health: {health_val}",
-                    delta_color="normal" if roe_val > 15.0 else "inverse",
+                    delta_color="normal" if (roe_val is not None and roe_val > 15.0) else "inverse",
                     help="Calculated DuPont Return on Equity."
                 )
                 st.caption("*(Total Return on Equity)*")
@@ -1584,7 +1676,7 @@ with tab_dupont:
                     "Piotroski F-Score",
                     f_disp_val,
                     f_badge_val,
-                    delta_color="normal" if f_score_val >= 8 else ("inverse" if f_score_val <= 4 else "off"),
+                    delta_color="normal" if (f_score_val is not None and f_score_val >= 8) else ("inverse" if (f_score_val is not None and f_score_val <= 4) else "off"),
                     help="9-Point Discrete Fundamental Health Score (0-9): Profitability, Solvency, Operating Efficiency."
                 )
                 st.caption("*(Balance Sheet Health)*")
@@ -1604,7 +1696,9 @@ with tab_dupont:
             elif accum_ratio_val >= 1.3:
                 st.info(f"🟢 **Steady Institutional Inflows ({accum_ratio_val:.2f}x Volume):** {selected_asset} exhibits consistent buying demand above its 90-day baseline.")
 
-            if f_score_val >= 8:
+            if f_score_val is None:
+                st.warning(f"⚪ **Piotroski F-Score Unavailable:** {f_badge_val}. Fresh capital allocation is blocked for {selected_asset} until real audited data is available (sync, or this is a Financial Institution the score doesn't apply to).")
+            elif f_score_val >= 8:
                 st.success(f"🟢 **Piotroski F-Score ({f_score_val}/9 — Strong):** {selected_asset} exhibits pristine financial strength across profitability, positive cash flows (CFO > Net Income), improving asset efficiency, and zero share dilution.")
             elif f_score_val <= 3:
                 st.error(f"⛔ **Piotroski F-Score ({f_score_val}/9 — Decaying / Distressed):** {selected_asset} shows deteriorating balance sheet quality, weak accruals, or elevated leverage. Fresh capital allocation blocked by Quality Gate.")
@@ -1613,11 +1707,11 @@ with tab_dupont:
             else:
                 st.info(f"🔵 **Piotroski F-Score ({f_score_val}/9 — Moderate Stability):** {selected_asset} maintains stable financial operations with sound solvency.")
 
-            if leverage_val > 3.0:
+            if leverage_val is not None and leverage_val > 3.0:
                 st.warning(f"⚠️ **High Financial Leverage ({leverage_val:.2f}x):** {selected_asset}'s ROE is heavily boosted by debt rather than high operating profit margins.")
-            elif npm_val > 20.0:
+            elif npm_val is not None and npm_val > 20.0:
                 st.info(f"💎 **Strong Pricing Power ({npm_val:.1f}% Margin):** {selected_asset} demonstrates a competitive moat with high net profitability.")
-            elif turnover_val > 1.2:
+            elif turnover_val is not None and turnover_val > 1.2:
                 st.info(f"⚡ **High Asset Velocity ({turnover_val:.2f}x Turnover):** {selected_asset} operates with lean, highly productive asset turnover.")
 
     st.markdown("---")
@@ -1684,10 +1778,10 @@ with tab_dupont:
                 "Fundamental Health": st.column_config.TextColumn("Health Classification", width="medium"),
                 "Fundamentals Source": st.column_config.TextColumn(
                     "Fundamentals Source",
-                    help="'Calibrated Snapshot' = a hand-curated, undated figure baked into the code. "
-                         "'Sector-Average Estimate' = no company-specific data at all -- this row reflects "
-                         "the sector average, not this company's own financials. Neither is live. Verify "
-                         "against the company's actual filings before trusting the F-Score gate.",
+                    help="'Screener.in (Audited)' = extracted from this company's own audited filings via "
+                         "Sync (unverified scraper -- spot-check it). 'Not Applicable (Financial Institution)' "
+                         "= a bank/NBFC the 9-point F-Score doesn't apply to; ROE/D-E are still real. "
+                         "'Sync Failed' / 'Not Yet Synced' = no verified data at all; fresh BUYs are blocked.",
                     width="medium"
                 ),
             },

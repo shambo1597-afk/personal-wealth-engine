@@ -7,12 +7,13 @@ import os
 import io
 import ssl
 import json
+import time
 import datetime
 import concurrent.futures
 import urllib.request
 import urllib.error
 import re
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -878,7 +879,9 @@ PARQUET_PRICES_PATH = os.path.join(DATA_DIR, 'market_prices.parquet')
 PARQUET_VOLUMES_PATH = os.path.join(DATA_DIR, 'market_volumes.parquet')
 PARQUET_FUNDAMENTALS_PATH = os.path.join(DATA_DIR, 'fundamentals.parquet')
 
-# Auto-wipe stale/corrupted dummy fundamentals cache on startup
+# Defensive startup check: wipe a fundamentals store that looks corrupted (near-zero ROE
+# variance across many rows is not a pattern real audited data produces, but could result from
+# a botched write). Harmless no-op against a normal Screener.in-synced store.
 if os.path.exists(PARQUET_FUNDAMENTALS_PATH) and os.path.getsize(PARQUET_FUNDAMENTALS_PATH) > 0:
     try:
         _df_init = pd.read_parquet(PARQUET_FUNDAMENTALS_PATH, engine='pyarrow')
@@ -892,278 +895,342 @@ def ensure_market_data_dir() -> None:
     """Ensures local data directory exists."""
     os.makedirs(DATA_DIR, exist_ok=True)
 
-# Exact audited financial metrics for major Indian bluechips (DuPont ROE, Net Margin, Debt/Equity, P/E)
-# Exact audited financial metrics for major Indian bluechips (DuPont ROE, Net Margin, Debt/Equity, P/E, Piotroski F-Score)
-CALIBRATED_CONSTITUENT_FUNDAMENTALS = {
-    # High-ROE FMCG / IT / Consumer Compounders
-    'TCS.NS': {'roe': 46.5, 'npm': 19.8, 'de': 0.08, 'pe': 29.5, 'turnover': 1.15, 'leverage': 2.05, 'f_score': 9},
-    'INFY.NS': {'roe': 32.4, 'npm': 17.2, 'de': 0.07, 'pe': 26.5, 'turnover': 0.95, 'leverage': 1.95, 'f_score': 8},
-    'HCLTECH.NS': {'roe': 28.5, 'npm': 15.8, 'de': 0.09, 'pe': 24.0, 'turnover': 0.90, 'leverage': 2.00, 'f_score': 8},
-    'WIPRO.NS': {'roe': 16.5, 'npm': 12.5, 'de': 0.18, 'pe': 22.0, 'turnover': 0.70, 'leverage': 1.85, 'f_score': 6},
-    'TECHM.NS': {'roe': 14.8, 'npm': 8.5, 'de': 0.12, 'pe': 34.0, 'turnover': 0.85, 'leverage': 2.05, 'f_score': 6},
-    'LTIM.NS': {'roe': 26.5, 'npm': 13.5, 'de': 0.08, 'pe': 35.0, 'turnover': 0.95, 'leverage': 2.05, 'f_score': 8},
-    'PERSISTENT.NS': {'roe': 25.8, 'npm': 11.2, 'de': 0.05, 'pe': 55.0, 'turnover': 1.05, 'leverage': 2.15, 'f_score': 8},
-    'COFORGE.NS': {'roe': 24.2, 'npm': 10.5, 'de': 0.25, 'pe': 48.0, 'turnover': 1.10, 'leverage': 2.10, 'f_score': 7},
-    'HINDUNILVR.NS': {'roe': 33.5, 'npm': 17.8, 'de': 0.04, 'pe': 56.0, 'turnover': 0.85, 'leverage': 2.20, 'f_score': 9},
-    'ITC.NS': {'roe': 29.8, 'npm': 28.5, 'de': 0.01, 'pe': 26.5, 'turnover': 0.65, 'leverage': 1.60, 'f_score': 9},
-    'NESTLEIND.NS': {'roe': 49.5, 'npm': 15.6, 'de': 0.12, 'pe': 68.0, 'turnover': 1.85, 'leverage': 1.70, 'f_score': 9},
-    'BRITANNIA.NS': {'roe': 43.5, 'npm': 13.8, 'de': 0.55, 'pe': 54.0, 'turnover': 1.45, 'leverage': 2.20, 'f_score': 8},
-    'TITAN.NS': {'roe': 31.2, 'npm': 8.6, 'de': 0.42, 'pe': 78.0, 'turnover': 2.10, 'leverage': 1.70, 'f_score': 8},
-    'TRENT.NS': {'roe': 34.5, 'npm': 9.5, 'de': 0.18, 'pe': 98.0, 'turnover': 1.95, 'leverage': 1.85, 'f_score': 8},
-    'PAGEIND.NS': {'roe': 42.0, 'npm': 14.2, 'de': 0.05, 'pe': 66.0, 'turnover': 1.75, 'leverage': 1.70, 'f_score': 8},
-    'ASIANPAINT.NS': {'roe': 27.5, 'npm': 14.8, 'de': 0.12, 'pe': 52.0, 'turnover': 1.05, 'leverage': 1.75, 'f_score': 8},
-    'PIDILITIND.NS': {'roe': 24.8, 'npm': 15.2, 'de': 0.05, 'pe': 72.0, 'turnover': 0.95, 'leverage': 1.70, 'f_score': 8},
-    'MARICO.NS': {'roe': 36.5, 'npm': 15.5, 'de': 0.15, 'pe': 52.0, 'turnover': 1.35, 'leverage': 1.75, 'f_score': 8},
-    'DABUR.NS': {'roe': 22.5, 'npm': 14.5, 'de': 0.12, 'pe': 48.0, 'turnover': 0.95, 'leverage': 1.65, 'f_score': 7},
-    'GODREJCP.NS': {'roe': 21.0, 'npm': 13.8, 'de': 0.28, 'pe': 58.0, 'turnover': 0.85, 'leverage': 1.80, 'f_score': 7},
-    'COLPAL.NS': {'roe': 48.0, 'npm': 23.5, 'de': 0.02, 'pe': 55.0, 'turnover': 1.15, 'leverage': 1.75, 'f_score': 9},
-    'DMART.NS': {'roe': 16.5, 'npm': 5.2, 'de': 0.02, 'pe': 95.0, 'turnover': 2.40, 'leverage': 1.30, 'f_score': 8},
-    'TATACONSUM.NS': {'roe': 11.2, 'npm': 7.5, 'de': 0.18, 'pe': 75.0, 'turnover': 0.70, 'leverage': 2.15, 'f_score': 6},
-    'VBL.NS': {'roe': 32.5, 'npm': 13.5, 'de': 0.55, 'pe': 72.0, 'turnover': 1.25, 'leverage': 1.95, 'f_score': 8},
+# ----------------------------------------------------------------------------------------------------
+# 3A. SCREENER.IN AUDITED FINANCIAL STATEMENT EXTRACTION ENGINE
+# ----------------------------------------------------------------------------------------------------
+# ================================ UNVERIFIED SCRAPER -- READ BEFORE TRUSTING ========================
+# This module was written without the ability to fetch a single live Screener.in page: the
+# development environment used to write it has its network egress policy blocked for
+# screener.in (confirmed via direct request -- HTTP 403 from the egress proxy, not from
+# Screener.in itself), so every CSS id / row-label assumption below is best-effort from prior
+# knowledge of Screener.in's public company-page layout, NOT confirmed against a real page.
+#
+# Before trusting a single number this produces for a real trade:
+#   1. Run sync_screener_fundamentals_for_universe() yourself, with real internet access.
+#   2. Check the 'Data Source' / 'sync_error' columns in data/fundamentals.parquet for any
+#      ticker showing 'Sync Failed' -- that means the parser did not recognize the page.
+#   3. Spot-check a handful of successfully-synced tickers' numbers against the actual
+#      screener.in page in your browser (Net Profit, Sales, Borrowings, ROE, D/E).
+#   4. Confirm Screener.in's current Terms of Use permit this kind of automated access for
+#      your use case -- this file does not attempt to interpret or guarantee compliance with
+#      their terms, and they are known to restrict automated/bulk scraping in general.
+# The extraction is deliberately conservative about failure: it never fabricates a number it
+# could not parse, and a ticker whose page structure isn't recognized is marked 'Sync Failed'
+# rather than silently given a plausible-looking but wrong value.
+# ======================================================================================================
 
-    # Capital Goods / Defense / Electricals
-    'BEL.NS': {'roe': 27.2, 'npm': 18.5, 'de': 0.02, 'pe': 44.0, 'turnover': 0.75, 'leverage': 1.95, 'f_score': 9},
-    'HAL.NS': {'roe': 29.5, 'npm': 22.0, 'de': 0.01, 'pe': 39.5, 'turnover': 0.65, 'leverage': 2.05, 'f_score': 9},
-    'SIEMENS.NS': {'roe': 22.5, 'npm': 12.2, 'de': 0.03, 'pe': 68.0, 'turnover': 0.95, 'leverage': 1.95, 'f_score': 8},
-    'ABB.NS': {'roe': 25.5, 'npm': 11.8, 'de': 0.02, 'pe': 82.0, 'turnover': 1.10, 'leverage': 1.95, 'f_score': 8},
-    'CUMMINSIND.NS': {'roe': 24.2, 'npm': 16.0, 'de': 0.04, 'pe': 48.0, 'turnover': 0.85, 'leverage': 1.75, 'f_score': 8},
-    'BHEL.NS': {'roe': 6.5, 'npm': 2.8, 'de': 0.28, 'pe': 65.0, 'turnover': 0.45, 'leverage': 5.15, 'f_score': 3},
-    'POLYCAB.NS': {'roe': 23.5, 'npm': 9.8, 'de': 0.05, 'pe': 48.0, 'turnover': 1.55, 'leverage': 1.55, 'f_score': 8},
-    'HAVELLS.NS': {'roe': 19.5, 'npm': 7.2, 'de': 0.08, 'pe': 65.0, 'turnover': 1.65, 'leverage': 1.65, 'f_score': 7},
+try:
+    from bs4 import BeautifulSoup
+    BS4_AVAILABLE = True
+except ImportError:
+    BS4_AVAILABLE = False
 
-    # High-Quality Private Banks & Financials
-    'HDFCBANK.NS': {'roe': 17.2, 'npm': 24.8, 'de': 5.80, 'pe': 18.5, 'turnover': 0.08, 'leverage': 8.65, 'f_score': 8},
-    'ICICIBANK.NS': {'roe': 18.8, 'npm': 25.5, 'de': 5.20, 'pe': 17.5, 'turnover': 0.08, 'leverage': 9.20, 'f_score': 8},
-    'KOTAKBANK.NS': {'roe': 15.2, 'npm': 26.2, 'de': 3.90, 'pe': 21.5, 'turnover': 0.08, 'leverage': 7.25, 'f_score': 8},
-    'AXISBANK.NS': {'roe': 17.5, 'npm': 21.5, 'de': 6.20, 'pe': 14.5, 'turnover': 0.08, 'leverage': 10.15, 'f_score': 7},
-    'INDUSINDBK.NS': {'roe': 15.0, 'npm': 18.2, 'de': 6.50, 'pe': 13.0, 'turnover': 0.08, 'leverage': 10.30, 'f_score': 6},
-    'BAJFINANCE.NS': {'roe': 22.8, 'npm': 23.8, 'de': 3.65, 'pe': 28.5, 'turnover': 0.16, 'leverage': 5.95, 'f_score': 8},
-    'BAJAJFINSV.NS': {'roe': 15.8, 'npm': 12.5, 'de': 2.80, 'pe': 32.0, 'turnover': 0.25, 'leverage': 5.05, 'f_score': 7},
-    'CHOLAFIN.NS': {'roe': 20.2, 'npm': 20.5, 'de': 5.10, 'pe': 26.0, 'turnover': 0.14, 'leverage': 7.05, 'f_score': 7},
-    'SHRIRAMFIN.NS': {'roe': 16.5, 'npm': 21.0, 'de': 4.50, 'pe': 13.5, 'turnover': 0.12, 'leverage': 6.55, 'f_score': 6},
-    'MUTHOOTFIN.NS': {'roe': 19.5, 'npm': 31.0, 'de': 3.10, 'pe': 16.0, 'turnover': 0.15, 'leverage': 4.20, 'f_score': 8},
+SCREENER_BASE_URL = 'https://www.screener.in'
+SCREENER_REQUEST_DELAY_SEC = 1.5  # polite rate limit between sequential per-ticker requests
+SCREENER_REQUEST_TIMEOUT_SEC = 15
 
-    # Public Sector Banks
-    'SBIN.NS': {'roe': 16.8, 'npm': 14.5, 'de': 9.50, 'pe': 10.5, 'turnover': 0.07, 'leverage': 16.50, 'f_score': 7},
-    'BANKBARODA.NS': {'roe': 15.5, 'npm': 13.8, 'de': 10.20, 'pe': 7.5, 'turnover': 0.07, 'leverage': 16.05, 'f_score': 6},
-    'PNB.NS': {'roe': 11.5, 'npm': 9.5, 'de': 12.50, 'pe': 8.2, 'turnover': 0.06, 'leverage': 20.15, 'f_score': 5},
-    'CANBK.NS': {'roe': 16.2, 'npm': 13.0, 'de': 11.00, 'pe': 6.8, 'turnover': 0.07, 'leverage': 17.80, 'f_score': 6},
-    'UNIONBANK.NS': {'roe': 14.8, 'npm': 12.5, 'de': 11.50, 'pe': 6.5, 'turnover': 0.07, 'leverage': 16.90, 'f_score': 5},
-    'INDIANB.NS': {'roe': 17.5, 'npm': 14.8, 'de': 9.80, 'pe': 7.2, 'turnover': 0.07, 'leverage': 16.90, 'f_score': 6},
+# The 9-point Piotroski F-Score and the Sales/Inventory/Current-Ratio-based DuPont inputs below
+# are defined for operating companies. Banks/NBFCs report Interest Income/Deposits/Advances
+# instead of Sales/Inventory, and their cash-flow statements are dominated by deposit flows
+# rather than operating accruals -- the standard 9-point test does not transfer cleanly to them.
+FINANCIAL_SECTOR_NAMES = {'Financials'}
 
-    # Commodity / Capital Heavy / Infra / Metals
-    'TATASTEEL.NS': {'roe': 11.8, 'npm': 7.2, 'de': 1.25, 'pe': 18.5, 'turnover': 0.78, 'leverage': 2.10, 'f_score': 5},
-    'JSWSTEEL.NS': {'roe': 13.5, 'npm': 8.2, 'de': 1.15, 'pe': 22.5, 'turnover': 0.82, 'leverage': 2.05, 'f_score': 6},
-    'HINDALCO.NS': {'roe': 12.9, 'npm': 7.9, 'de': 0.95, 'pe': 14.8, 'turnover': 0.85, 'leverage': 1.95, 'f_score': 6},
-    'VEDL.NS': {'roe': 15.2, 'npm': 9.2, 'de': 1.65, 'pe': 11.2, 'turnover': 0.72, 'leverage': 2.30, 'f_score': 5},
-    'JINDALSTEL.NS': {'roe': 14.5, 'npm': 10.5, 'de': 0.65, 'pe': 15.5, 'turnover': 0.75, 'leverage': 1.85, 'f_score': 6},
-    'COALINDIA.NS': {'roe': 46.5, 'npm': 26.5, 'de': 0.15, 'pe': 8.5, 'turnover': 0.75, 'leverage': 2.35, 'f_score': 9},
-    'NMDC.NS': {'roe': 24.5, 'npm': 27.5, 'de': 0.05, 'pe': 12.5, 'turnover': 0.55, 'leverage': 1.60, 'f_score': 8},
-    'ADANIENT.NS': {'roe': 9.5, 'npm': 3.2, 'de': 1.45, 'pe': 78.0, 'turnover': 0.75, 'leverage': 3.95, 'f_score': 3},
-    'ADANIPORTS.NS': {'roe': 17.5, 'npm': 31.5, 'de': 0.85, 'pe': 34.0, 'turnover': 0.28, 'leverage': 2.00, 'f_score': 7},
-    'ULTRACEMCO.NS': {'roe': 14.2, 'npm': 10.2, 'de': 0.35, 'pe': 42.0, 'turnover': 0.72, 'leverage': 1.95, 'f_score': 7},
-    'GRASIM.NS': {'roe': 8.5, 'npm': 5.5, 'de': 0.85, 'pe': 28.0, 'turnover': 0.45, 'leverage': 3.45, 'f_score': 4},
-    'LT.NS': {'roe': 16.8, 'npm': 8.8, 'de': 0.90, 'pe': 32.5, 'turnover': 0.65, 'leverage': 2.95, 'f_score': 7},
 
-    # Auto & Auto Ancillaries
-    'MARUTI.NS': {'roe': 17.5, 'npm': 9.8, 'de': 0.02, 'pe': 27.5, 'turnover': 1.35, 'leverage': 1.30, 'f_score': 9},
-    'M&M.NS': {'roe': 21.8, 'npm': 11.5, 'de': 0.45, 'pe': 24.5, 'turnover': 0.95, 'leverage': 2.00, 'f_score': 8},
-    'TATAMOTORS.NS': {'roe': 27.5, 'npm': 7.9, 'de': 0.85, 'pe': 11.8, 'turnover': 1.15, 'leverage': 3.05, 'f_score': 8},
-    'BAJAJ-AUTO.NS': {'roe': 26.5, 'npm': 16.5, 'de': 0.02, 'pe': 34.0, 'turnover': 1.25, 'leverage': 1.30, 'f_score': 9},
-    'EICHERMOT.NS': {'roe': 24.8, 'npm': 24.5, 'de': 0.03, 'pe': 32.0, 'turnover': 0.85, 'leverage': 1.20, 'f_score': 8},
-    'TVSMOTOR.NS': {'roe': 28.5, 'npm': 6.8, 'de': 0.95, 'pe': 52.0, 'turnover': 2.45, 'leverage': 1.70, 'f_score': 8},
-    'HEROMOTOCO.NS': {'roe': 22.0, 'npm': 10.5, 'de': 0.02, 'pe': 25.0, 'turnover': 1.65, 'leverage': 1.25, 'f_score': 8},
-    'BHARATFORG.NS': {'roe': 18.2, 'npm': 8.5, 'de': 0.75, 'pe': 44.0, 'turnover': 0.85, 'leverage': 2.50, 'f_score': 6},
+def _screener_symbol(ticker: str) -> str:
+    """Converts 'TCS.NS' / 'RELIANCE.BO' -> the bare exchange symbol Screener.in URLs use."""
+    return str(ticker).replace('.NS', '').replace('.BO', '').strip().upper()
 
-    # Pharmaceuticals & Healthcare
-    'SUNPHARMA.NS': {'roe': 17.8, 'npm': 21.2, 'de': 0.08, 'pe': 36.5, 'turnover': 0.55, 'leverage': 1.55, 'f_score': 8},
-    'CIPLA.NS': {'roe': 16.5, 'npm': 18.8, 'de': 0.05, 'pe': 28.5, 'turnover': 0.65, 'leverage': 1.35, 'f_score': 8},
-    'DRREDDY.NS': {'roe': 18.2, 'npm': 19.5, 'de': 0.10, 'pe': 22.5, 'turnover': 0.65, 'leverage': 1.45, 'f_score': 8},
-    'DIVISLAB.NS': {'roe': 15.5, 'npm': 22.5, 'de': 0.01, 'pe': 68.0, 'turnover': 0.45, 'leverage': 1.55, 'f_score': 8},
-    'APOLLOHOSP.NS': {'roe': 16.8, 'npm': 5.8, 'de': 0.55, 'pe': 78.0, 'turnover': 1.45, 'leverage': 2.00, 'f_score': 7},
-    'ZYDUSLIFE.NS': {'roe': 25.5, 'npm': 21.0, 'de': 0.25, 'pe': 26.0, 'turnover': 0.70, 'leverage': 1.75, 'f_score': 8},
-    'LUPIN.NS': {'roe': 18.5, 'npm': 11.2, 'de': 0.25, 'pe': 38.0, 'turnover': 0.75, 'leverage': 2.20, 'f_score': 7},
 
-    # Energy, Oil & Gas, Power Utilities
-    'RELIANCE.NS': {'roe': 10.8, 'npm': 7.8, 'de': 0.55, 'pe': 26.8, 'turnover': 0.52, 'leverage': 2.65, 'f_score': 6},
-    'ONGC.NS': {'roe': 14.5, 'npm': 8.5, 'de': 0.45, 'pe': 8.0, 'turnover': 0.45, 'leverage': 3.80, 'f_score': 7},
-    'NTPC.NS': {'roe': 13.8, 'npm': 14.2, 'de': 1.40, 'pe': 15.5, 'turnover': 0.42, 'leverage': 2.30, 'f_score': 6},
-    'POWERGRID.NS': {'roe': 19.5, 'npm': 34.5, 'de': 1.30, 'pe': 17.8, 'turnover': 0.18, 'leverage': 3.15, 'f_score': 7},
-    'BPCL.NS': {'roe': 24.5, 'npm': 5.5, 'de': 0.65, 'pe': 9.5, 'turnover': 2.80, 'leverage': 1.60, 'f_score': 7},
-    'IOC.NS': {'roe': 18.5, 'npm': 4.8, 'de': 0.75, 'pe': 8.5, 'turnover': 2.40, 'leverage': 1.60, 'f_score': 6},
-    'GAIL.NS': {'roe': 15.2, 'npm': 7.5, 'de': 0.25, 'pe': 14.0, 'turnover': 1.25, 'leverage': 1.60, 'f_score': 7},
-    'TATAPOWER.NS': {'roe': 13.2, 'npm': 7.2, 'de': 1.55, 'pe': 35.0, 'turnover': 0.48, 'leverage': 3.80, 'f_score': 6},
-}
-
-SECTOR_FUNDAMENTAL_BENCHMARKS = {
-    'Information Technology': {'roe': 31.5, 'npm': 16.5, 'de': 0.08, 'pe': 28.0, 'turnover': 0.95, 'leverage': 2.05},
-    'IT': {'roe': 31.5, 'npm': 16.5, 'de': 0.08, 'pe': 28.0, 'turnover': 0.95, 'leverage': 2.05},
-    'Fast Moving Consumer Goods': {'roe': 34.0, 'npm': 16.0, 'de': 0.12, 'pe': 54.0, 'turnover': 1.15, 'leverage': 1.85},
-    'Consumer Goods': {'roe': 32.0, 'npm': 14.5, 'de': 0.15, 'pe': 52.0, 'turnover': 1.10, 'leverage': 1.90},
-    'Consumer Durables': {'roe': 24.5, 'npm': 9.5, 'de': 0.20, 'pe': 55.0, 'turnover': 1.55, 'leverage': 1.65},
-    'Consumer Services': {'roe': 22.0, 'npm': 8.5, 'de': 0.25, 'pe': 65.0, 'turnover': 1.65, 'leverage': 1.60},
-    'Capital Goods': {'roe': 23.5, 'npm': 13.5, 'de': 0.12, 'pe': 46.0, 'turnover': 0.85, 'leverage': 2.05},
-    'Automobile and Auto Components': {'roe': 22.5, 'npm': 10.5, 'de': 0.35, 'pe': 26.0, 'turnover': 1.25, 'leverage': 1.70},
-    'Auto': {'roe': 22.5, 'npm': 10.5, 'de': 0.35, 'pe': 26.0, 'turnover': 1.25, 'leverage': 1.70},
-    'Healthcare': {'roe': 18.5, 'npm': 18.5, 'de': 0.12, 'pe': 34.0, 'turnover': 0.65, 'leverage': 1.55},
-    'Pharmaceuticals': {'roe': 18.5, 'npm': 18.5, 'de': 0.12, 'pe': 34.0, 'turnover': 0.65, 'leverage': 1.55},
-    'Financial Services': {'roe': 16.5, 'npm': 22.5, 'de': 5.20, 'pe': 18.0, 'turnover': 0.08, 'leverage': 9.10},
-    'Banks': {'roe': 16.0, 'npm': 21.0, 'de': 6.50, 'pe': 16.0, 'turnover': 0.08, 'leverage': 10.50},
-    'Metals & Mining': {'roe': 13.5, 'npm': 8.5, 'de': 1.15, 'pe': 16.5, 'turnover': 0.78, 'leverage': 2.05},
-    'Metals': {'roe': 13.5, 'npm': 8.5, 'de': 1.15, 'pe': 16.5, 'turnover': 0.78, 'leverage': 2.05},
-    'Oil Gas & Consumable Fuels': {'roe': 16.5, 'npm': 9.5, 'de': 0.75, 'pe': 14.5, 'turnover': 1.15, 'leverage': 2.20},
-    'Power': {'roe': 15.5, 'npm': 15.0, 'de': 1.45, 'pe': 18.0, 'turnover': 0.35, 'leverage': 2.95},
-    'Construction': {'roe': 14.5, 'npm': 7.5, 'de': 0.95, 'pe': 32.0, 'turnover': 0.75, 'leverage': 2.65},
-    'Construction Materials': {'roe': 13.5, 'npm': 9.5, 'de': 0.45, 'pe': 38.0, 'turnover': 0.65, 'leverage': 2.15},
-    'Chemicals': {'roe': 18.5, 'npm': 13.0, 'de': 0.25, 'pe': 36.0, 'turnover': 0.85, 'leverage': 1.65},
-    'Telecommunication': {'roe': 17.5, 'npm': 12.5, 'de': 1.35, 'pe': 44.0, 'turnover': 0.45, 'leverage': 3.10},
-    'Services': {'roe': 16.0, 'npm': 10.0, 'de': 0.85, 'pe': 32.0, 'turnover': 0.85, 'leverage': 2.15},
-    'Realty': {'roe': 9.5, 'npm': 14.0, 'de': 0.85, 'pe': 45.0, 'turnover': 0.25, 'leverage': 2.70},
-}
-
-def compute_piotroski_f_score(
-    ticker: str,
-    roe: Optional[float] = None,
-    npm: Optional[float] = None,
-    de: Optional[float] = None,
-    turnover: Optional[float] = None,
-    leverage: Optional[float] = None,
-    sector: Optional[str] = None,
-    raw_fundamentals: Optional[Dict[str, Any]] = None,
-    yf_info: Optional[Dict[str, Any]] = None,
-) -> Tuple[int, str, str, Dict[str, bool]]:
+def fetch_screener_company_html(
+    ticker: str, session: Optional[requests.Session] = None
+) -> Tuple[Optional[str], Optional[str]]:
     """
-    Computes the discrete 9-Point Piotroski F-Score (0 to 9) for equity constituents based on:
-      1. Profitability (4 points):
-         - Positive Net Income (ROA / NPM > 0)
-         - Positive Cash Flow from Operations (CFO > 0)
-         - ROA Improvement YoY (ΔROA > 0)
-         - Accrual Quality: CFO > Net Income (Quality of cash earnings)
-      2. Leverage, Liquidity & Solvency (3 points):
-         - Debt/Equity Reduction (ΔD/E ≤ 0 or conservative low leverage)
-         - Current Ratio Improvement (ΔCurrent Ratio > 0 / CR ≥ 1.25)
-         - No Dilution (No new equity shares issued YoY)
-      3. Operating Efficiency (2 points):
-         - Gross/Operating Margin Improvement (ΔMargin > 0)
-         - Asset Turnover Improvement (ΔTurnover > 0)
-
-    Returns:
-      piotroski_f_score (int): 0 to 9
-      f_score_label (str): "🟢 Strong (8-9/9)" | "🔵 Moderate (5-7/9)" | "🔴 Weak / Decay (≤4/9)"
-      f_score_display (str): "8/9 ★" | "6/9" | "3/9 ⚠️"
-      point_breakdown (dict): Boolean evaluation for all 9 criteria
+    Fetches the raw HTML of a Screener.in company page. Tries the consolidated-financials view
+    first (most large-caps), then falls back to the standalone view for companies Screener.in
+    does not show consolidated statements for. Returns (html, error) -- html is None on any
+    failure, with error describing why (network failure vs. non-200 response).
     """
-    # 1. Check calibrated profile override
-    if raw_fundamentals and isinstance(raw_fundamentals, dict) and 'f_score' in raw_fundamentals:
-        calib_score = int(raw_fundamentals['f_score'])
-        breakdown = {
-            'pos_net_income': calib_score >= 1,
-            'pos_cfo': calib_score >= 2,
-            'roa_improving': calib_score >= 3,
-            'cfo_gt_net_income': calib_score >= 4,
-            'de_reduction': calib_score >= 5,
-            'current_ratio_improving': calib_score >= 6,
-            'no_dilution': calib_score >= 7,
-            'margin_improving': calib_score >= 8,
-            'turnover_improving': calib_score >= 9
+    sess = session or GLOBAL_RESILIENT_SESSION
+    symbol = _screener_symbol(ticker)
+    urls = [
+        f"{SCREENER_BASE_URL}/company/{symbol}/consolidated/",
+        f"{SCREENER_BASE_URL}/company/{symbol}/",
+    ]
+    last_error = None
+    for url in urls:
+        try:
+            resp = sess.get(url, timeout=SCREENER_REQUEST_TIMEOUT_SEC, headers={'Accept': 'text/html'})
+            if resp.status_code == 200 and resp.text:
+                return resp.text, None
+            last_error = f"HTTP {resp.status_code} from {url}"
+        except Exception as e:
+            last_error = f"Request failed for {url}: {e}"
+    return None, last_error
+
+
+def _clean_screener_number(raw: Optional[str]) -> Optional[float]:
+    """Parses a Screener.in table cell ('1,234', '-56.7', '12.3%', '', '-') into float or None."""
+    if raw is None:
+        return None
+    s = str(raw).strip().replace(',', '').replace('%', '')
+    if s in ('', '-', '--'):
+        return None
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_screener_statement_table(soup: Any, section_id: str) -> Dict[str, List[Optional[float]]]:
+    """
+    Parses a Screener.in <section id="{section_id}"> financial-statement table into
+    {row_label: [values oldest -> newest]}. Keys off each row's leading label-cell text rather
+    than positional/CSS-class assumptions, since line-item wording ("Net Profit", "Sales",
+    "Borrowings") is far more stable across Screener.in redesigns than markup/class names.
+    """
+    if soup is None:
+        return {}
+    section = soup.find(id=section_id)
+    if section is None:
+        return {}
+    table = section.find('table')
+    if table is None:
+        return {}
+
+    rows: Dict[str, List[Optional[float]]] = {}
+    for tr in table.find_all('tr'):
+        cells = tr.find_all(['td', 'th'])
+        if len(cells) < 2:
+            continue
+        label = cells[0].get_text(strip=True)
+        if not label:
+            continue
+        values = [_clean_screener_number(c.get_text(strip=True)) for c in cells[1:]]
+        rows[label] = values
+    return rows
+
+
+def _parse_screener_top_ratios(soup: Any) -> Dict[str, float]:
+    """Parses Screener.in's quick top-ratios list (Market Cap, Stock P/E, ROE, Face Value, etc.)."""
+    out: Dict[str, float] = {}
+    if soup is None:
+        return out
+    container = soup.find(id='top-ratios')
+    if container is None:
+        return out
+    for li in container.find_all('li'):
+        name_el = li.find(class_='name')
+        value_el = li.find(class_='value')
+        if name_el is None or value_el is None:
+            continue
+        name = name_el.get_text(strip=True)
+        val = _clean_screener_number(value_el.get_text(strip=True))
+        if val is not None:
+            out[name] = val
+    return out
+
+
+def _find_statement_row(
+    table: Dict[str, List[Optional[float]]], *label_candidates: str
+) -> Optional[List[Optional[float]]]:
+    """Case/whitespace-insensitive lookup of a financial-statement row by any of several
+    accepted labels (statement wording differs slightly between company types)."""
+    for cand in label_candidates:
+        for label, values in table.items():
+            if cand.strip().lower() == label.strip().lower():
+                return values
+    return None
+
+
+def extract_screener_financials(ticker: str, session: Optional[requests.Session] = None) -> Dict[str, Any]:
+    """
+    Fetches and parses a company's audited financial statements from Screener.in: multi-year
+    Profit & Loss, Balance Sheet, and Cash Flow tables. Returns a structured dict of the raw
+    time series -- every field is either the real parsed number or None, never an estimate.
+    On any failure (network error, or a page that doesn't contain the expected P&L/Balance
+    Sheet sections), returns {'success': False, 'error': <reason>} rather than partial/guessed data.
+    """
+    if not BS4_AVAILABLE:
+        return {'ticker': ticker, 'success': False, 'error': 'beautifulsoup4 is not installed'}
+
+    html, fetch_error = fetch_screener_company_html(ticker, session=session)
+    if html is None:
+        return {'ticker': ticker, 'success': False, 'error': fetch_error or 'Fetch failed'}
+
+    try:
+        soup = BeautifulSoup(html, 'html.parser')
+    except Exception as e:
+        return {'ticker': ticker, 'success': False, 'error': f'HTML parse failed: {e}'}
+
+    pnl = _parse_screener_statement_table(soup, 'profit-loss')
+    bs = _parse_screener_statement_table(soup, 'balance-sheet')
+    cf = _parse_screener_statement_table(soup, 'cash-flow')
+    top_ratios = _parse_screener_top_ratios(soup)
+
+    sales = _find_statement_row(pnl, 'Sales', 'Revenue', 'Revenue From Operations')
+    net_profit = _find_statement_row(pnl, 'Net Profit', 'Net Profit +', 'Profit After Tax')
+    opm_pct = _find_statement_row(pnl, 'OPM %', 'NIM %')
+    equity_share_capital = _find_statement_row(bs, 'Equity Share Capital', 'Equity Capital')
+    reserves = _find_statement_row(bs, 'Reserves', 'Reserves and Surplus')
+    borrowings = _find_statement_row(bs, 'Borrowings', 'Borrowing')
+    deposits = _find_statement_row(bs, 'Deposits')
+    total_assets = _find_statement_row(bs, 'Total Assets')
+    cfo = _find_statement_row(cf, 'Cash from Operating Activity', 'Cash From Operating Activity')
+
+    if sales is None and net_profit is None:
+        return {
+            'ticker': ticker, 'success': False,
+            'error': ("Fetched a page but found neither a Sales/Revenue nor a Net Profit row in "
+                      "its Profit & Loss section -- Screener.in's table structure for this ticker "
+                      "may differ from what this scraper expects, or the page layout has changed."),
         }
-        score = calib_score
-    elif yf_info and isinstance(yf_info, dict) and ('netIncomeToCommon' in yf_info or 'operatingCashflow' in yf_info):
-        # Live Yahoo Finance financial statement criteria
-        net_inc = yf_info.get('netIncomeToCommon', 0.0) or 0.0
-        cfo = yf_info.get('operatingCashflow', 0.0) or 0.0
-        cr = yf_info.get('currentRatio', 1.0) or 1.0
-        sh_growth = yf_info.get('sharesPercentSharesOut', 0.0) or 0.0
-        de_val = float(de if de is not None else 0.40)
-        r = float(roe if roe is not None else 16.0)
-        m = float(npm if npm is not None else 12.0)
-        t_val = float(turnover if turnover is not None else 0.85)
 
-        p1 = bool(net_inc > 0 or m > 0)
-        p2 = bool(cfo > 0 or r > 5.0)
-        p3 = bool(r >= 12.0)
-        p4 = bool(cfo > net_inc if (cfo != 0 and net_inc != 0) else (m >= 8.0))
-        p5 = bool(de_val <= 0.80)
-        p6 = bool(cr >= 1.20 or de_val <= 1.0)
-        p7 = bool(sh_growth <= 0.02)
-        p8 = bool(m >= 10.0)
-        p9 = bool(t_val >= 0.70)
+    total_equity = None
+    if reserves is not None and equity_share_capital is not None and len(reserves) == len(equity_share_capital):
+        total_equity = [
+            (r if r is not None else 0.0) + (e if e is not None else 0.0)
+            if (r is not None or e is not None) else None
+            for r, e in zip(reserves, equity_share_capital)
+        ]
 
-        breakdown = {
-            'pos_net_income': p1,
-            'pos_cfo': p2,
-            'roa_improving': p3,
-            'cfo_gt_net_income': p4,
-            'de_reduction': p5,
-            'current_ratio_improving': p6,
-            'no_dilution': p7,
-            'margin_improving': p8,
-            'turnover_improving': p9
-        }
-        score = int(sum(1 for v in breakdown.values() if v))
-    elif roe is not None and npm is not None and de is not None:
-        # Deterministic scoring from verified fundamental ratios
-        r = float(roe)
-        m = float(npm)
-        d = float(de)
-        t_val = float(turnover if turnover is not None else 0.85)
+    return {
+        'ticker': ticker,
+        'success': True,
+        'error': None,
+        'sales': sales,
+        'net_profit': net_profit,
+        'opm_pct': opm_pct,
+        'equity_share_capital': equity_share_capital,
+        'total_equity': total_equity,
+        'borrowings': borrowings,
+        'deposits': deposits,
+        'total_assets': total_assets,
+        'cfo': cfo,
+        'top_ratios': top_ratios,
+    }
 
-        p1 = bool(m > 0 or r > 0)
-        p2 = bool(r > 4.0 and m > 2.0)
-        p3 = bool(r >= 14.0)
-        p4 = bool(m >= 8.0)
-        p5 = bool(d <= 0.75)
-        p6 = bool(d <= 1.25)
-        p7 = True
-        p8 = bool(m >= 12.0)
-        p9 = bool(t_val >= 0.65)
 
-        if d > 2.5 or r < 6.0 or m < 3.0:
-            p3 = False
-            p4 = False
-            p5 = False
-            p8 = False
-            p9 = False
+def compute_dupont_and_piotroski_from_financials(
+    financials: Dict[str, Any], is_financial_institution: bool = False
+) -> Dict[str, Any]:
+    """
+    Computes real 3-stage DuPont ROE, Debt/Equity, and the 9-point Piotroski F-Score from
+    audited multi-year financial statement data (as returned by extract_screener_financials).
 
-        breakdown = {
-            'pos_net_income': p1,
-            'pos_cfo': p2,
-            'roa_improving': p3,
-            'cfo_gt_net_income': p4,
-            'de_reduction': p5,
-            'current_ratio_improving': p6,
-            'no_dilution': p7,
-            'margin_improving': p8,
-            'turnover_improving': p9
-        }
-        score = int(sum(1 for v in breakdown.values() if v))
-    else:
-        # Neutral verified fallback for unverified / uncalibrated entities
-        score = 6
-        breakdown = {
-            'pos_net_income': True,
-            'pos_cfo': True,
-            'roa_improving': True,
-            'cfo_gt_net_income': True,
-            'de_reduction': True,
-            'current_ratio_improving': True,
-            'no_dilution': False,
-            'margin_improving': False,
-            'turnover_improving': False
-        }
+    Never estimates a missing value: a metric that can't be computed from the available data
+    is returned as None, and the corresponding Piotroski criterion is marked unavailable (None
+    in the breakdown, counted as not-earned in the numeric score) rather than guessed -- a
+    safety gate should not grant the benefit of the doubt on data it doesn't have.
 
-    score = int(np.clip(score, 0, 9))
-    if score >= 8:
-        label = "🟢 Strong (8-9/9)"
-        display = f"{score}/9 ★"
-    elif score >= 5:
-        label = "🔵 Moderate (5-7/9)"
-        display = f"{score}/9"
-    else:
-        label = "🔴 Weak / Decay (≤4/9)"
-        display = f"{score}/9 ⚠️" if score <= 3 else f"{score}/9"
+    For banks/NBFCs (is_financial_institution=True), the Piotroski F-Score is intentionally
+    not computed (see FINANCIAL_SECTOR_NAMES docstring above) -- only DuPont ROE and D/E,
+    which remain meaningful, are returned.
+    """
+    def _latest_two(series: Optional[List[Optional[float]]]) -> Tuple[Optional[float], Optional[float]]:
+        if not series:
+            return None, None
+        latest = series[-1] if len(series) >= 1 else None
+        prior = series[-2] if len(series) >= 2 else None
+        return latest, prior
 
-    return score, label, display, breakdown
+    sales_l, sales_p = _latest_two(financials.get('sales'))
+    net_profit_l, net_profit_p = _latest_two(financials.get('net_profit'))
+    total_assets_l, total_assets_p = _latest_two(financials.get('total_assets'))
+    total_equity_l, total_equity_p = _latest_two(financials.get('total_equity'))
+    borrowings_l, borrowings_p = _latest_two(financials.get('borrowings'))
+    cfo_l, _cfo_p = _latest_two(financials.get('cfo'))
+    opm_l, opm_p = _latest_two(financials.get('opm_pct'))
+    shares_l, shares_p = _latest_two(financials.get('equity_share_capital'))
+
+    # --- Real 3-Stage DuPont ROE: Net Margin x Asset Turnover x Financial Leverage ---
+    net_margin = (
+        (net_profit_l / sales_l) * 100.0
+        if (net_profit_l is not None and sales_l not in (None, 0)) else None
+    )
+    asset_turnover = (
+        sales_l / total_assets_l
+        if (sales_l is not None and total_assets_l not in (None, 0)) else None
+    )
+    financial_leverage = (
+        total_assets_l / total_equity_l
+        if (total_assets_l is not None and total_equity_l not in (None, 0)) else None
+    )
+    roe = None
+    if net_margin is not None and asset_turnover is not None and financial_leverage is not None:
+        roe = (net_margin / 100.0) * asset_turnover * financial_leverage * 100.0
+
+    debt_to_equity = (
+        borrowings_l / total_equity_l
+        if (borrowings_l is not None and total_equity_l not in (None, 0)) else None
+    )
+
+    result: Dict[str, Any] = {
+        'roe': roe,
+        'net_margin': net_margin,
+        'asset_turnover': asset_turnover,
+        'financial_leverage': financial_leverage,
+        'debt_to_equity': debt_to_equity,
+    }
+
+    if is_financial_institution:
+        result['piotroski_score'] = None
+        result['piotroski_criteria_available'] = 0
+        result['piotroski_breakdown'] = {}
+        result['piotroski_note'] = (
+            "Not Applicable -- the 9-point Piotroski F-Score is defined for operating "
+            "companies and does not transfer cleanly to banks/NBFCs (no comparable Current "
+            "Ratio / Inventory, and CFO is dominated by deposit flows rather than operating "
+            "accruals). DuPont ROE and Debt/Equity above remain meaningful."
+        )
+        return result
+
+    # --- 9-Point Piotroski F-Score from real YoY deltas ---
+    breakdown: Dict[str, Optional[bool]] = {}
+
+    breakdown['pos_net_income'] = (net_profit_l > 0) if net_profit_l is not None else None
+    breakdown['pos_cfo'] = (cfo_l > 0) if cfo_l is not None else None
+
+    roa_l = (net_profit_l / total_assets_l) if (net_profit_l is not None and total_assets_l not in (None, 0)) else None
+    roa_p = (net_profit_p / total_assets_p) if (net_profit_p is not None and total_assets_p not in (None, 0)) else None
+    breakdown['roa_improving'] = (roa_l > roa_p) if (roa_l is not None and roa_p is not None) else None
+
+    breakdown['cfo_gt_net_income'] = (
+        (cfo_l > net_profit_l) if (cfo_l is not None and net_profit_l is not None) else None
+    )
+
+    de_l = (borrowings_l / total_equity_l) if (borrowings_l is not None and total_equity_l not in (None, 0)) else None
+    de_p = (borrowings_p / total_equity_p) if (borrowings_p is not None and total_equity_p not in (None, 0)) else None
+    breakdown['de_reduction'] = (de_l <= de_p) if (de_l is not None and de_p is not None) else None
+
+    # Screener.in's standard Balance Sheet view doesn't break Current Assets/Liabilities out of
+    # its "Other Assets"/"Other Liabilities" catch-all rows for most companies, so a genuine
+    # Current Ratio isn't reliably derivable here -- correctly flagged unavailable (None) rather
+    # than guessed at.
+    breakdown['current_ratio_improving'] = None
+
+    breakdown['no_dilution'] = (
+        (shares_l <= shares_p * 1.01) if (shares_l is not None and shares_p not in (None, 0)) else None
+    )
+
+    breakdown['margin_improving'] = (opm_l > opm_p) if (opm_l is not None and opm_p is not None) else None
+
+    at_l = asset_turnover
+    at_p = (sales_p / total_assets_p) if (sales_p is not None and total_assets_p not in (None, 0)) else None
+    breakdown['turnover_improving'] = (at_l > at_p) if (at_l is not None and at_p is not None) else None
+
+    criteria_available = sum(1 for v in breakdown.values() if v is not None)
+    score = sum(1 for v in breakdown.values() if v is True)
+
+    result['piotroski_score'] = score
+    result['piotroski_criteria_available'] = criteria_available
+    result['piotroski_breakdown'] = breakdown
+    result['piotroski_note'] = (
+        None if criteria_available == 9
+        else f"{9 - criteria_available} of 9 criteria unavailable from the fetched statement data "
+             f"(counted as not-earned, not estimated) -- see piotroski_breakdown for which."
+    )
+    return result
+
 
 def load_local_parquet_fundamentals(
     fundamentals_path: str = PARQUET_FUNDAMENTALS_PATH, max_age_days: int = 30
@@ -1216,151 +1283,217 @@ def save_local_parquet_fundamentals(df_fund: pd.DataFrame, fundamentals_path: st
     except Exception:
         return False
 
-def _fetch_single_fundamental(t: str, sector: Optional[str] = None, turbo_mode: bool = False) -> Dict[str, Any]:
+def _health_tag_from_dupont(roe_val: Optional[float], de_val: Optional[float], f_score: Optional[int]) -> str:
+    """Qualitative balance-sheet health tag from real (or unavailable) DuPont/Piotroski inputs."""
+    if roe_val is None and de_val is None:
+        return '⚪ Insufficient Data'
+    if f_score is not None and f_score <= 3:
+        return "🔴 Weak / Decay (≤4/9)"
+    if de_val is not None and de_val > 2.50:
+        return "⚠️ Highly Leveraged"
+    if roe_val is not None and roe_val < 8.0:
+        return "⚠️ Low Return on Equity"
+    if (de_val is not None and de_val < 0.65 and roe_val is not None and roe_val >= 16.0
+            and (f_score is None or f_score >= 8)):
+        return "✅ High Quality (Solvent)"
+    if f_score is not None and f_score >= 8:
+        return "🟢 Strong Balance Sheet"
+    return "🔵 Moderate Stability"
+
+
+def _not_yet_synced_fundamentals_row(ticker: str) -> Dict[str, Any]:
     """
-    NOT LIVE DATA. Every value here comes from one of two static sources, never from a live
-    filing or API call:
-      1. CALIBRATED_CONSTITUENT_FUNDAMENTALS -- a hand-curated, undated snapshot dict for ~100
-         large-caps, frozen at whatever point it was written into this file.
-      2. SECTOR_FUNDAMENTAL_BENCHMARKS -- a sector-average fallback for everything else, which
-         reflects the sector, not the individual company's actual balance sheet.
-    The returned dict's 'Data Source' key tells you which path was used for a given ticker.
-    Before trusting the Piotroski F-Score gate on any real trade, cross-check the company's
-    current filings yourself -- this function will not detect a deterioration or improvement
-    that happened after these numbers were written.
+    The explicit 'no verified data for this ticker' row. Downstream buy-eligibility logic must
+    treat this as blocked, not as a neutral/permissive default -- there is nothing to act on.
     """
-    clean_sym = t.replace('.NS', '')
-    live_info = None
-
-    # 1. Hand-curated constituent snapshot match (NOT live -- see CALIBRATED_CONSTITUENT_FUNDAMENTALS
-    #    docstring for provenance/staleness caveats).
-    if t in CALIBRATED_CONSTITUENT_FUNDAMENTALS:
-        prof = CALIBRATED_CONSTITUENT_FUNDAMENTALS[t]
-        roe_val = float(prof['roe'])
-        npm_val = float(prof['npm'])
-        de_val = float(prof['de'])
-        pe_val = float(prof['pe'])
-        turnover_val = float(prof.get('turnover', 0.75))
-        leverage_val = float(prof.get('leverage', 1.85))
-        data_source = 'Calibrated Snapshot'
-    else:
-        prof = None
-        roe_val = None
-        npm_val = None
-        de_val = None
-        pe_val = None
-        data_source = 'Sector-Average Estimate'
-
-        # 3. Industry-calibrated fallback with clean deterministic sector averages
-        if roe_val is None or npm_val is None or de_val is None or pe_val is None:
-            # Determine sector benchmark
-            sec_name = str(sector or 'Equities')
-            sec_bench = None
-            for k, v in SECTOR_FUNDAMENTAL_BENCHMARKS.items():
-                if k.lower() in sec_name.lower() or sec_name.lower() in k.lower():
-                    sec_bench = v
-                    break
-            if sec_bench is None:
-                sec_bench = {'roe': 18.5, 'npm': 12.5, 'de': 0.40, 'pe': 28.0, 'turnover': 0.85, 'leverage': 1.80}
-            
-            if roe_val is None:
-                roe_val = float(sec_bench['roe'])
-            if npm_val is None:
-                npm_val = float(sec_bench['npm'])
-            if de_val is None:
-                de_val = float(sec_bench['de'])
-            if pe_val is None:
-                pe_val = float(sec_bench['pe'])
-                
-        turnover_val = float(np.clip(roe_val / (max(npm_val, 1.0) * 1.8), 0.20, 2.80))
-        leverage_val = float(np.clip(1.0 + de_val, 1.05, 18.0))
-
-    # Compute discrete 9-point Piotroski F-Score
-    f_score, f_label, f_display, f_breakdown = compute_piotroski_f_score(
-        t, roe=roe_val, npm=npm_val, de=de_val, turnover=turnover_val,
-        leverage=leverage_val, sector=sector, raw_fundamentals=prof, yf_info=live_info
-    )
-
-    # Assign Fundamental Health Tag based on realistic solvency, margins & Piotroski score
-    if f_score <= 3 or de_val > 2.50 or roe_val < 8.0 or npm_val < 4.0:
-        health_tag = "🔴 Weak / Decay (≤4/9)" if f_score <= 4 else "⚠️ Leveraged / Low Margin"
-    elif de_val < 0.65 and roe_val >= 16.0 and npm_val >= 10.0 and f_score >= 8:
-        health_tag = "✅ High Quality (Solvent)"
-    elif f_score >= 8:
-        health_tag = "🟢 Strong Balance Sheet"
-    else:
-        health_tag = "🔵 Moderate Stability"
-
     return {
-        'Ticker': t,
-        'Asset': clean_sym,
-        'DuPont ROE (%)': f"{roe_val:.1f}%",
-        'Net Profit Margin (%)': f"{npm_val:.1f}%",
-        'Asset Turnover (x)': f"{turnover_val:.2f}x",
-        'Financial Leverage (x)': f"{leverage_val:.2f}x",
-        'Debt / Equity': f"{de_val:.2f}x",
-        'P/E Ratio': f"{pe_val:.1f}x",
-        'Fundamental Health': health_tag,
-        'Piotroski F-Score': f_display,
-        'piotroski_f_score': int(f_score),
-        'piotroski_badge': f_label,
-        'f_score_num': int(f_score),
-        'f_score_label': f_label,
-        'f_score_display': f_display,
-        'roe_num': float(np.round(roe_val, 2)),
-        'de_num': float(np.round(de_val, 2)),
-        'npm_num': float(np.round(npm_val, 2)),
-        'turnover_num': float(np.round(turnover_val, 2)),
-        'leverage_num': float(np.round(leverage_val, 2)),
-        'pe_num': float(np.round(pe_val, 2)),
-        'Data Source': data_source,
+        'Ticker': ticker, 'Asset': ticker.replace('.NS', ''),
+        'Data Source': 'Not Yet Synced', 'sync_error': None, 'last_synced_utc': None,
+        'DuPont ROE (%)': 'N/A', 'Net Profit Margin (%)': 'N/A', 'Asset Turnover (x)': 'N/A',
+        'Financial Leverage (x)': 'N/A', 'Debt / Equity': 'N/A', 'P/E Ratio': 'N/A',
+        'Fundamental Health': '⚪ Not Yet Synced', 'Piotroski F-Score': 'N/A',
+        'piotroski_f_score': None, 'piotroski_badge': '⚪ Not Yet Synced', 'f_score_num': None,
+        'f_score_label': '⚪ Not Yet Synced', 'f_score_display': 'N/A',
+        'roe_num': np.nan, 'de_num': np.nan, 'npm_num': np.nan, 'turnover_num': np.nan,
+        'leverage_num': np.nan, 'pe_num': np.nan,
+        'piotroski_criteria_available': None, 'piotroski_note': None,
     }
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_universe_fundamentals(
-    tickers: List[str], sector_map: Optional[Dict[str, str]] = None, turbo_mode: bool = False
+
+def _build_fundamentals_row(ticker: str, sector: Optional[str], financials: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Assembles one row of the persisted fundamentals table from a Screener.in extraction result
+    (as returned by extract_screener_financials), routed through the real DuPont/Piotroski
+    computation. A failed extraction produces a 'Sync Failed' row with null numerics --
+    never a fabricated fallback value.
+    """
+    clean_sym = ticker.replace('.NS', '')
+    now_utc = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+
+    if not financials.get('success'):
+        row = _not_yet_synced_fundamentals_row(ticker)
+        row['Data Source'] = 'Sync Failed'
+        row['sync_error'] = financials.get('error', 'Unknown error')
+        row['last_synced_utc'] = now_utc
+        row['Fundamental Health'] = '⛔ Sync Failed'
+        row['piotroski_badge'] = '⛔ Sync Failed'
+        row['f_score_label'] = '⛔ Sync Failed'
+        return row
+
+    is_financial = str(sector or '') in FINANCIAL_SECTOR_NAMES
+    dupont = compute_dupont_and_piotroski_from_financials(financials, is_financial_institution=is_financial)
+
+    roe_val = dupont['roe']
+    npm_val = dupont['net_margin']
+    de_val = dupont['debt_to_equity']
+    turnover_val = dupont['asset_turnover']
+    leverage_val = dupont['financial_leverage']
+    pe_val = (financials.get('top_ratios') or {}).get('Stock P/E')
+
+    f_score = dupont['piotroski_score']
+    crit_avail = dupont.get('piotroski_criteria_available')
+
+    if is_financial or f_score is None:
+        f_badge = '⚪ N/A (Financial Institution)' if is_financial else '⚪ Insufficient History'
+        f_display = 'N/A'
+    else:
+        if f_score >= 8:
+            f_badge = "🟢 Strong (8-9/9)"
+        elif f_score >= 5:
+            f_badge = "🔵 Moderate (5-7/9)"
+        else:
+            f_badge = "🔴 Weak / Decay (≤4/9)"
+        suffix = " ★" if f_score >= 8 else (" ⚠️" if f_score <= 3 else "")
+        avail_note = "" if crit_avail == 9 else f" ({crit_avail}/9 criteria available)"
+        f_display = f"{f_score}/9{suffix}{avail_note}"
+
+    return {
+        'Ticker': ticker,
+        'Asset': clean_sym,
+        'Data Source': 'Not Applicable (Financial Institution)' if is_financial else 'Screener.in (Audited)',
+        'sync_error': None,
+        'last_synced_utc': now_utc,
+        'DuPont ROE (%)': f"{roe_val:.1f}%" if roe_val is not None else 'N/A',
+        'Net Profit Margin (%)': f"{npm_val:.1f}%" if npm_val is not None else 'N/A',
+        'Asset Turnover (x)': f"{turnover_val:.2f}x" if turnover_val is not None else 'N/A',
+        'Financial Leverage (x)': f"{leverage_val:.2f}x" if leverage_val is not None else 'N/A',
+        'Debt / Equity': f"{de_val:.2f}x" if de_val is not None else 'N/A',
+        'P/E Ratio': f"{pe_val:.1f}x" if pe_val is not None else 'N/A',
+        'Fundamental Health': _health_tag_from_dupont(roe_val, de_val, f_score),
+        'Piotroski F-Score': f_display,
+        'piotroski_f_score': int(f_score) if f_score is not None else None,
+        'piotroski_badge': f_badge,
+        'f_score_num': int(f_score) if f_score is not None else None,
+        'f_score_label': f_badge,
+        'f_score_display': f_display,
+        'roe_num': float(roe_val) if roe_val is not None else np.nan,
+        'de_num': float(de_val) if de_val is not None else np.nan,
+        'npm_num': float(npm_val) if npm_val is not None else np.nan,
+        'turnover_num': float(turnover_val) if turnover_val is not None else np.nan,
+        'leverage_num': float(leverage_val) if leverage_val is not None else np.nan,
+        'pe_num': float(pe_val) if pe_val is not None else np.nan,
+        'piotroski_criteria_available': crit_avail,
+        'piotroski_note': dupont.get('piotroski_note'),
+    }
+
+
+def sync_screener_fundamentals_for_universe(
+    tickers: List[str],
+    sector_map: Optional[Dict[str, str]] = None,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    session: Optional[requests.Session] = None,
+    fundamentals_path: Optional[str] = None,
 ) -> pd.DataFrame:
     """
-    High-performance Persistent Local Fundamentals Store with 30-day Parquet cache.
-    
-    1. Checks if data/fundamentals.parquet exists and is less than 30 days old.
-    2. If valid, reads directly in < 20ms and reindexes to the requested tickers.
-    3. If missing or stale, generates realistic, industry-calibrated fundamental metrics,
-       saves to Parquet, and returns.
+    The ONLY function that populates data/fundamentals.parquet. Sequentially fetches and parses
+    each ticker's audited statements from Screener.in with a polite rate-limit delay between
+    requests, computes real DuPont/Piotroski metrics, and persists the full result set -- wired
+    to the "🔄 Sync Audited Filings" button in Tab 3.
+
+    This is deliberately sequential and rate-limited (not parallelized) to avoid hammering
+    Screener.in; for a ~200-ticker universe this is a multi-minute operation by design.
+    progress_callback(done_count, total_count, current_ticker) fires after every ticker so a
+    caller (e.g. a Streamlit progress bar) can show live progress. fundamentals_path overrides
+    the default store location (used by tests to avoid touching the real data/ directory).
+    """
+    sec_dict = sector_map if isinstance(sector_map, dict) else {}
+    sess = session or GLOBAL_RESILIENT_SESSION
+    tickers_list = list(dict.fromkeys(tickers))  # de-dupe, preserve order
+    total = len(tickers_list)
+    rows = []
+
+    for i, t in enumerate(tickers_list):
+        financials = extract_screener_financials(t, session=sess)
+        rows.append(_build_fundamentals_row(t, sec_dict.get(t), financials))
+        if progress_callback is not None:
+            try:
+                progress_callback(i + 1, total, t)
+            except Exception:
+                pass
+        if i < total - 1:
+            time.sleep(SCREENER_REQUEST_DELAY_SEC)
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        if fundamentals_path:
+            save_local_parquet_fundamentals(df, fundamentals_path=fundamentals_path)
+        else:
+            save_local_parquet_fundamentals(df)
+    return df
+
+
+def get_fundamentals_last_synced(fundamentals_path: Optional[str] = None) -> Optional[str]:
+    """Returns the most recent 'last_synced_utc' timestamp in the persisted store, or None."""
+    path = fundamentals_path or PARQUET_FUNDAMENTALS_PATH
+    df = load_local_parquet_fundamentals(fundamentals_path=path, max_age_days=36500)
+    if df is None or df.empty or 'last_synced_utc' not in df.columns:
+        return None
+    valid = df['last_synced_utc'].dropna()
+    return str(valid.max()) if not valid.empty else None
+
+
+def fetch_universe_fundamentals(
+    tickers: List[str],
+    sector_map: Optional[Dict[str, str]] = None,
+    turbo_mode: bool = False,
+    fundamentals_path: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    Reads the persisted, sync-only fundamentals store (data/fundamentals.parquet). This function
+    NEVER fetches from Screener.in itself and NEVER fabricates a fallback value -- the only way
+    the store gets populated or refreshed is an explicit call to
+    sync_screener_fundamentals_for_universe() (the "Sync Audited Filings" button). A ticker with
+    no row in the store comes back with Data Source = 'Not Yet Synced' and null numeric fields,
+    which downstream buy-eligibility logic must treat as blocked, never as a neutral default.
+
+    turbo_mode is accepted for call-site backward compatibility but no longer changes behavior:
+    there is no more live-vs-cache distinction now that nothing here live-fetches.
+    fundamentals_path overrides the default store location (used by tests).
     """
     if not tickers:
         return pd.DataFrame()
-    
+
     tickers_list = list(tickers)
-    sec_dict = sector_map if isinstance(sector_map, dict) else {}
-    
-    # 1. Attempt to load from persistent local Parquet store (< 20ms)
-    cached_df = load_local_parquet_fundamentals(max_age_days=30)
-    
-    if cached_df is not None and not cached_df.empty and 'Ticker' in cached_df.columns:
-        cached_tickers = set(cached_df['Ticker'])
-        missing_tickers = [t for t in tickers_list if t not in cached_tickers]
-        
-        if not missing_tickers:
-            # All requested tickers present in valid 30-day Parquet store: return immediately!
-            return cached_df.set_index('Ticker').reindex(tickers_list).reset_index()
-        
-        # Incremental generation for missing tickers
-        new_results = [_fetch_single_fundamental(t, sector=sec_dict.get(t), turbo_mode=turbo_mode) for t in missing_tickers]
-        new_df = pd.DataFrame(new_results)
-        merged_df = pd.concat([cached_df, new_df], ignore_index=True)
-        merged_df = merged_df.drop_duplicates(subset=['Ticker'], keep='last')
-        save_local_parquet_fundamentals(merged_df)
-        return merged_df.set_index('Ticker').reindex(tickers_list).reset_index()
-    
-    # 2. Cold Start / Stale / Purged Store: Generate complete realistic fundamentals in < 30ms
-    results = [_fetch_single_fundamental(t, sector=sec_dict.get(t), turbo_mode=turbo_mode) for t in tickers_list]
-    df = pd.DataFrame(results)
-    if not df.empty and 'Ticker' in df.columns:
-        df = df.drop_duplicates(subset=['Ticker'], keep='last')
-        save_local_parquet_fundamentals(df)
-        df = df.set_index('Ticker').reindex(tickers_list).reset_index()
-    return df
+    path = fundamentals_path or PARQUET_FUNDAMENTALS_PATH
+    # No time-based expiry here: the store is refreshed only by an explicit sync, and its
+    # vintage is surfaced to the user via the "Last Synced" badge, not silently discarded.
+    cached_df = load_local_parquet_fundamentals(fundamentals_path=path, max_age_days=36500)
+
+    if cached_df is None or cached_df.empty or 'Ticker' not in cached_df.columns:
+        return pd.DataFrame([_not_yet_synced_fundamentals_row(t) for t in tickers_list])
+
+    cached_by_ticker = cached_df.set_index('Ticker')
+    rows = []
+    for t in tickers_list:
+        if t in cached_by_ticker.index:
+            row = cached_by_ticker.loc[t]
+            row_dict = row.iloc[0].to_dict() if isinstance(row, pd.DataFrame) else row.to_dict()
+            row_dict['Ticker'] = t
+            rows.append(row_dict)
+        else:
+            rows.append(_not_yet_synced_fundamentals_row(t))
+    return pd.DataFrame(rows)
+
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_fundamental_scorecard(tickers: List[str]) -> pd.DataFrame:
@@ -1498,27 +1631,31 @@ def compute_multifactor_rankings(
     for t in valid_cols:
         if t in fund_map.index:
             row = fund_map.loc[t]
-            roe_val = float(row.get('roe_num', 16.0))
-            de_val = float(row.get('de_num', 0.40))
-            npm_val = float(row.get('npm_num', 14.0))
-            pe_val = float(row.get('pe_num', 25.0))
-            f_sc = int(row.get('piotroski_f_score', row.get('f_score_num', 7)))
-            f_lb = str(row.get('piotroski_badge', row.get('f_score_label', '🔵 Moderate (5-7/9)')))
-            f_disp = str(row.get('Piotroski F-Score', row.get('f_score_display', f"{f_sc}/9 ★" if f_sc >= 8 else f"{f_sc}/9")))
-            h_tag = str(row.get('Fundamental Health', '✅ High Quality (Solvent)'))
-            d_src = str(row.get('Data Source', 'Sector-Average Estimate'))
+            roe_val = row.get('roe_num', np.nan)
+            de_val = row.get('de_num', np.nan)
+            npm_val = row.get('npm_num', np.nan)
+            pe_val = row.get('pe_num', np.nan)
+            f_sc_raw = row.get('piotroski_f_score', row.get('f_score_num', None))
+            f_sc = None if pd.isna(f_sc_raw) else int(f_sc_raw)
+            f_lb = str(row.get('piotroski_badge', row.get('f_score_label', '⚪ Not Yet Synced')))
+            f_disp = str(row.get('Piotroski F-Score', row.get('f_score_display', 'N/A')))
+            h_tag = str(row.get('Fundamental Health', '⚪ Not Yet Synced'))
+            d_src = str(row.get('Data Source', 'Not Yet Synced'))
         else:
-            roe_val, de_val, npm_val, pe_val, f_sc, f_lb, f_disp, h_tag = 16.0, 0.40, 14.0, 25.0, 7, '🔵 Moderate (5-7/9)', '7/9', '✅ High Quality (Solvent)'
-            d_src = 'Sector-Average Estimate'
+            # No row at all for this ticker in the fundamentals store -- genuinely no data,
+            # never a fabricated "average" placeholder.
+            roe_val, de_val, npm_val, pe_val, f_sc = np.nan, np.nan, np.nan, np.nan, None
+            f_lb, f_disp, h_tag = '⚪ Not Yet Synced', 'N/A', '⚪ Not Yet Synced'
+            d_src = 'Not Yet Synced'
 
-        roe_series[t] = roe_val
-        de_series[t] = de_val
-        solvency_series[t] = 1.0 / (1.0 + max(0.0, de_val))
-        f_score_series[t] = float(f_sc)
+        roe_series[t] = float(roe_val) if pd.notna(roe_val) else np.nan
+        de_series[t] = float(de_val) if pd.notna(de_val) else np.nan
+        solvency_series[t] = (1.0 / (1.0 + max(0.0, float(de_val)))) if pd.notna(de_val) else np.nan
+        f_score_series[t] = float(f_sc) if f_sc is not None else np.nan
         f_label_series[t] = f_lb
         f_display_series[t] = f_disp
-        npm_series[t] = npm_val
-        pe_series[t] = pe_val
+        npm_series[t] = float(npm_val) if pd.notna(npm_val) else np.nan
+        pe_series[t] = float(pe_val) if pd.notna(pe_val) else np.nan
         health_series[t] = h_tag
         data_source_series[t] = d_src
 
@@ -1556,7 +1693,17 @@ def compute_multifactor_rankings(
     # 8. Composite Multi-Factor Score: 35% Quality, 35% Momentum, 15% Volatility Penalty, 15% Institutional Accumulation
     composite_score = (0.35 * z_qual) + (0.35 * z_mom) + (0.15 * z_vol) + (0.15 * z_accum)
 
-    is_fscore_safe = {t: (f_score_series[t] > 3) for t in valid_cols}
+    # A ticker is exempt from the F-Score gate (not blocked purely for lacking one) only when it
+    # is a Financial Institution the score genuinely doesn't apply to -- never for missing data.
+    is_data_available = {
+        t: data_source_series[t] in ('Screener.in (Audited)', 'Not Applicable (Financial Institution)')
+        for t in valid_cols
+    }
+    is_fscore_safe = {
+        t: (data_source_series[t] == 'Not Applicable (Financial Institution)')
+           or (pd.notna(f_score_series[t]) and f_score_series[t] > 3)
+        for t in valid_cols
+    }
 
     df = pd.DataFrame({
         'Ticker': valid_cols,
@@ -1567,10 +1714,11 @@ def compute_multifactor_rankings(
         'Liquidity_Gate': ['🟢 Liquid (≥₹10 Cr)' if is_liquid_map[t] else '🔴 Illiquid (<₹10 Cr)' for t in valid_cols],
         'Piotroski_Score': f_display_series,
         'Piotroski_F_Score': f_score_series,
-        'piotroski_f_score': f_score_series.astype(int),
+        'piotroski_f_score': f_score_series.astype('Int64'),
         'piotroski_badge': f_label_series,
         'F_Score_Label': f_label_series,
         'F_Score_Safe': [is_fscore_safe[t] for t in valid_cols],
+        'Data_Available': [is_data_available[t] for t in valid_cols],
         'Composite_Score': composite_score,
         'Z_qual': z_qual,
         'Z_mom': z_mom,
@@ -1594,36 +1742,48 @@ def compute_multifactor_rankings(
         'Fundamentals Source': data_source_series
     })
 
-    # Liquid equities with safe F-scores are prioritized; decaying / illiquid ones are gated out
-    # 1. Eligible Liquid Candidates with F-Score > 3
-    eligible_mask = (df['Is_Liquid'] == True) & (df['F_Score_Safe'] == True)
+    # Liquid equities with real audited data and safe F-scores are prioritized; decaying,
+    # unsynced, and illiquid ones are gated out. Checked in this order:
+    # 1. Eligible Liquid Candidates: real data, F-Score > 3 (or exempt as a Financial Institution)
+    eligible_mask = (df['Is_Liquid'] == True) & (df['F_Score_Safe'] == True) & (df['Data_Available'] == True)
     eligible_sub = df[eligible_mask].sort_values(by='Composite_Score', ascending=False).copy()
     eligible_sub['Rank'] = range(1, len(eligible_sub) + 1)
     eligible_sub['Selection_Status'] = [f'🟢 Selected (Top {top_n})' if r <= top_n else '⚪ Liquid Candidate' for r in eligible_sub['Rank']]
 
-    # 2. Liquid Candidates with Deteriorating F-Score (<= 3) - BLOCKED from optimizer
-    f_blocked_mask = (df['Is_Liquid'] == True) & (df['F_Score_Safe'] == False)
+    # 2. Liquid Candidates with real data but Deteriorating F-Score (<= 3) - BLOCKED from optimizer
+    f_blocked_mask = (df['Is_Liquid'] == True) & (df['F_Score_Safe'] == False) & (df['Data_Available'] == True)
     f_blocked_sub = df[f_blocked_mask].sort_values(by='Composite_Score', ascending=False).copy()
     if not f_blocked_sub.empty:
         f_blocked_sub['Rank'] = range(len(eligible_sub) + 1, len(eligible_sub) + len(f_blocked_sub) + 1)
         f_blocked_sub['Selection_Status'] = '⛔ F-Score Deteriorating (Blocked)'
 
-    # 3. Illiquid Gate Blocked
+    # 3. Liquid Candidates with no verified audited data at all -- BLOCKED, never given a
+    #    neutral/average placeholder score. Distinct from an F-Score gate failure: this means
+    #    "we don't know", not "we know and it's bad".
+    unsynced_mask = (df['Is_Liquid'] == True) & (df['Data_Available'] == False)
+    unsynced_sub = df[unsynced_mask].sort_values(by='Composite_Score', ascending=False).copy()
+    if not unsynced_sub.empty:
+        offset = len(eligible_sub) + len(f_blocked_sub)
+        unsynced_sub['Rank'] = range(offset + 1, offset + len(unsynced_sub) + 1)
+        unsynced_sub['Selection_Status'] = '⛔ Fundamentals Not Synced (Blocked)'
+
+    # 4. Illiquid Gate Blocked
     illiquid_mask = df['Is_Liquid'] == False
     illiquid_sub = df[illiquid_mask].sort_values(by='Composite_Score', ascending=False).copy()
     if not illiquid_sub.empty:
-        offset = len(eligible_sub) + len(f_blocked_sub)
+        offset = len(eligible_sub) + len(f_blocked_sub) + len(unsynced_sub)
         illiquid_sub['Rank'] = range(offset + 1, offset + len(illiquid_sub) + 1)
         illiquid_sub['Selection_Status'] = '⛔ Illiquid Gate Blocked (<₹10 Cr)'
 
-    sub_dfs = [s for s in [eligible_sub, f_blocked_sub, illiquid_sub] if not s.empty]
+    sub_dfs = [s for s in [eligible_sub, f_blocked_sub, unsynced_sub, illiquid_sub] if not s.empty]
     df_ranked = pd.concat(sub_dfs).sort_values(by='Rank', ascending=True)
 
-    # Clean display fields
+    # Clean display fields -- 'N/A' for any metric that couldn't be computed, never a silently
+    # formatted NaN.
     df_ranked['ADTV 90D (₹ Cr)'] = df_ranked['ADTV_90d_Cr'].apply(lambda x: f"₹{x:.1f} Cr" if x > 0 else "N/A")
-    df_ranked['DuPont ROE (%)'] = df_ranked['ROE_Clean'].apply(lambda x: f"{x:.1f}%")
-    df_ranked['Debt/Equity'] = df_ranked['DE_Clean'].apply(lambda x: f"{x:.2f}x")
-    df_ranked['Net Margin (%)'] = df_ranked['NPM_Clean'].apply(lambda x: f"{x:.1f}%")
+    df_ranked['DuPont ROE (%)'] = df_ranked['ROE_Clean'].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "N/A")
+    df_ranked['Debt/Equity'] = df_ranked['DE_Clean'].apply(lambda x: f"{x:.2f}x" if pd.notna(x) else "N/A")
+    df_ranked['Net Margin (%)'] = df_ranked['NPM_Clean'].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "N/A")
     df_ranked['12M-1M Momentum (%)'] = df_ranked['Momentum_Raw'].apply(lambda x: f"{x*100:+.1f}%")
     df_ranked['60D Realized Vol (%)'] = df_ranked['Vol_60d_Raw'].apply(lambda x: f"{x*100:.1f}%")
     df_ranked['Accumulation Ratio'] = df_ranked['Accumulation_Ratio'].apply(lambda x: f"{x:.2f}x")
