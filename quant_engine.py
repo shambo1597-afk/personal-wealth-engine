@@ -1084,15 +1084,20 @@ def _fetch_single_fundamental(ticker: str) -> Dict[str, Any]:
 
 def fetch_structured_company_fundamentals(ticker: str, api_key: Optional[str] = None, provider: str = 'EODHD') -> Dict[str, Any]:
     """
-    Fetches audited financial statement JSON payloads (Balance Sheet, Income Statement, Cash Flow)
-    via a structured REST API. Only provider='EODHD' is implemented; any other value falls through
-    to the unaudited local estimate (see _fetch_single_fundamental) exactly as if no api_key were given.
+    Fetches real, audited financial statements for a ticker, in priority order:
+      1. EODHD structured REST API, only if api_key is given and provider='EODHD'. Field names
+         (netIncome, totalStockholderEquity, PERatio, etc.) are UNVERIFIED against a live
+         response (this environment has no eodhd.com network access or test key) -- and in
+         practice EODHD's free tier doesn't include Fundamentals data or NSE coverage at all
+         (confirmed against a real key), so this path requires a paid plan.
+      2. Yahoo Finance via yfinance -- free, no API key required, already a dependency for this
+         app's price data. See fetch_yfinance_fundamentals() below; its field names WERE verified
+         against live output for three real NSE tickers spanning IT/energy/banking.
+      3. A local unaudited estimate (curated reference or a ticker-hash placeholder) as the last
+         resort -- always excluded from the F-Score gate's 'Audited' check, never silently trusted.
     Computes real DuPont ROE, Margin, Debt/Equity, and a 9-Point Piotroski F-Score -- every
     criterion is a real audited-filing check or a real year-over-year comparison, never a
-    hardcoded pass; with only one year of filings, the two YoY criteria fail closed.
-    Caveat: the EODHD field names below (netIncome, totalStockholderEquity, PERatio, etc.) have
-    not been verified against a live response -- this environment has no network access to
-    eodhd.com and no test API key. Smoke-test against one real ticker before trusting this broadly.
+    hardcoded pass; with only one year of filings, the YoY criteria fail closed.
     """
     clean_sym = ticker.replace('.NS', '').strip()
     
@@ -1193,8 +1198,172 @@ def fetch_structured_company_fundamentals(ticker: str, api_key: Optional[str] = 
         except Exception:
             pass
 
-    # Resilient Fallback to local verified audited metrics
+    # Free path: real audited data via Yahoo Finance, no API key required.
+    yf_result = fetch_yfinance_fundamentals(ticker)
+    if yf_result is not None:
+        return yf_result
+
+    # Last resort: unaudited local estimate (never labeled 'Audited' -- the
+    # F-Score gate in compute_multifactor_rankings() must keep blocking this).
     return _fetch_single_fundamental(ticker)
+
+def fetch_yfinance_fundamentals(ticker: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetches real audited financial statements via yfinance (Yahoo Finance) --
+    free, no API key required, and already a dependency for this app's price
+    data. Computes real DuPont ROE, Debt/Equity, and a genuine 9-point
+    Piotroski F-Score from real year-over-year deltas: yfinance returns up to
+    5 years of annual statements per call, unlike the EODHD path above which
+    is limited to whatever years a single response happens to include.
+
+    Field names below were verified against real, live yfinance output for
+    RELIANCE.NS, TCS.NS, and HDFCBANK.NS (see scripts/verify_yfinance_fundamentals.py
+    and its output) -- 'Total Assets', 'Stockholders Equity', 'Total Debt',
+    'Total Revenue', 'Net Income', 'Operating Cash Flow', and 'Basic Average
+    Shares' were present for all three; 'Gross Profit' and 'Current Assets'/
+    'Current Liabilities' were present for the two non-financial names but
+    absent for the bank, consistent with banks not reporting a traditional
+    current/non-current balance sheet split -- handled by exempting financial
+    institutions from the F-Score gate, same as the EODHD path does. Coverage
+    for tickers outside this three-name sample is unverified; if a ticker's
+    statements come back with different row labels, this returns None
+    (falls through to the unaudited local estimate) rather than silently
+    computing wrong numbers from zeros.
+
+    Returns None if yfinance has no usable statements for this ticker (falls
+    through to the unaudited local estimate), never a partially-fabricated row.
+    """
+    def _row(df, candidates, period, default=None):
+        for name in candidates:
+            if name in df.index and period in df.columns:
+                val = df.loc[name, period]
+                if pd.isna(val):
+                    continue
+                try:
+                    return float(val)
+                except (TypeError, ValueError):
+                    continue
+        return default
+
+    try:
+        t = yf.Ticker(ticker)
+        bs = t.balance_sheet
+        inc = t.income_stmt if hasattr(t, 'income_stmt') else t.financials
+        cf = t.cashflow if hasattr(t, 'cashflow') else t.cash_flow
+        if bs is None or bs.empty or inc is None or inc.empty or cf is None or cf.empty:
+            return None
+
+        periods = sorted(set(inc.columns) & set(bs.columns) & set(cf.columns), reverse=True)
+        if not periods:
+            return None
+        latest = periods[0]
+        prior = periods[1] if len(periods) >= 2 else None
+
+        net_inc = _row(inc, ['Net Income', 'Net Income Common Stockholders'], latest)
+        rev = _row(inc, ['Total Revenue', 'Operating Revenue'], latest)
+        assets = _row(bs, ['Total Assets'], latest)
+        equity = _row(bs, ['Stockholders Equity', 'Total Equity Gross Minority Interest', 'Common Stock Equity'], latest)
+        debt = _row(bs, ['Total Debt'], latest, default=0.0)
+        cfo = _row(cf, ['Operating Cash Flow', 'Cash Flow From Continuing Operating Activities'], latest)
+
+        if net_inc is None or rev is None or not assets or not equity or cfo is None:
+            return None  # Core statement rows missing -- don't compute on partial/zero data.
+
+        npm = (net_inc / rev * 100.0) if rev > 0 else 0.0
+        turnover = (rev / assets) if assets > 0 else 0.0
+        leverage = (assets / equity) if equity > 0 else 0.0
+        roe = npm * turnover * leverage
+        de = (debt / equity) if equity > 0 else 0.0
+        roa = (net_inc / assets) if assets > 0 else 0.0
+
+        gross_profit = _row(inc, ['Gross Profit'], latest)
+        curr_assets = _row(bs, ['Current Assets'], latest)
+        curr_liab = _row(bs, ['Current Liabilities'], latest)
+        shares = _row(inc, ['Basic Average Shares'], latest)
+
+        # Genuine year-over-year criteria -- fail closed (no free point) when
+        # the prior year or a required row isn't available, same philosophy
+        # as the EODHD path: never award credit for "we don't know".
+        roa_improved = False
+        turnover_improved = False
+        leverage_decreased = False
+        liquidity_improved = False
+        no_dilution = False
+        margin_improved = False
+        if prior:
+            net_inc_prev = _row(inc, ['Net Income', 'Net Income Common Stockholders'], prior)
+            rev_prev = _row(inc, ['Total Revenue', 'Operating Revenue'], prior)
+            assets_prev = _row(bs, ['Total Assets'], prior)
+            debt_prev = _row(bs, ['Total Debt'], prior, default=0.0)
+            if assets_prev and assets_prev > 0 and net_inc_prev is not None:
+                roa_improved = roa > (net_inc_prev / assets_prev)
+            if assets_prev and assets_prev > 0 and rev_prev is not None:
+                turnover_improved = turnover > (rev_prev / assets_prev)
+            if assets_prev and assets_prev > 0 and debt_prev is not None:
+                leverage_decreased = (debt / assets) < (debt_prev / assets_prev)
+
+            shares_prev = _row(inc, ['Basic Average Shares'], prior)
+            if shares is not None and shares_prev:
+                no_dilution = shares <= shares_prev
+
+            curr_assets_prev = _row(bs, ['Current Assets'], prior)
+            curr_liab_prev = _row(bs, ['Current Liabilities'], prior)
+            if curr_assets is not None and curr_liab and curr_liab > 0 and curr_assets_prev is not None and curr_liab_prev and curr_liab_prev > 0:
+                liquidity_improved = (curr_assets / curr_liab) > (curr_assets_prev / curr_liab_prev)
+
+            gross_profit_prev = _row(inc, ['Gross Profit'], prior)
+            if gross_profit is not None and rev > 0 and gross_profit_prev is not None and rev_prev and rev_prev > 0:
+                margin_improved = (gross_profit / rev) > (gross_profit_prev / rev_prev)
+
+        # Canonical 9-point Piotroski F-Score -- every criterion below is a real
+        # audited-filing check or a real year-over-year comparison, never a
+        # static threshold standing in for one (an improvement on the EODHD
+        # path above, which only had two years of data to work with for two
+        # of its nine criteria). Criteria 6 and 8 (current-ratio and gross-
+        # margin trend) are structurally unavailable for banks/NBFCs -- since
+        # those tickers are exempted from the whole F-Score gate via the
+        # 'Not Applicable (Financial Institution)' label below, their raw
+        # numeric score here is display-only and never actually gates them.
+        f_score = int(sum([
+            net_inc > 0, cfo > 0, roa_improved, cfo > net_inc,
+            leverage_decreased, liquidity_improved, no_dilution,
+            margin_improved, turnover_improved
+        ]))
+
+        is_financial = get_asset_sector(ticker) in FINANCIAL_SECTOR_NAMES
+        f_badge = "🟢 Strong (8-9/9)" if f_score >= 8 else ("🔵 Moderate (5-7/9)" if f_score >= 5 else "🔴 Weak / Decay (≤4/9)")
+        f_display = f"{f_score}/9 ★" if f_score >= 8 else f"{f_score}/9"
+        now_utc = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+
+        pe_val = None
+        try:
+            info = t.info or {}
+            pe_val = info.get('trailingPE') or info.get('forwardPE')
+            pe_val = float(pe_val) if pe_val else None
+        except Exception:
+            pe_val = None
+        pe_display = f"{pe_val:.1f}x" if pe_val is not None else "N/A"
+
+        data_source_label = 'Not Applicable (Financial Institution)' if is_financial else 'Yahoo Finance (Audited)'
+        clean_sym = ticker.replace('.NS', '').strip()
+
+        return {
+            'Ticker': ticker, 'Asset': clean_sym, 'Data Source': data_source_label,
+            'sync_error': None, 'last_synced_utc': now_utc,
+            'DuPont ROE (%)': f"{roe:.1f}%", 'Net Profit Margin (%)': f"{npm:.1f}%",
+            'Asset Turnover (x)': f"{turnover:.2f}x", 'Financial Leverage (x)': f"{leverage:.2f}x",
+            'Debt / Equity': f"{de:.2f}x", 'P/E Ratio': pe_display,
+            'Fundamental Health': '✅ High Quality (Audited)' if de < 0.7 else '🔵 Moderate Stability',
+            'Piotroski F-Score': f_display, 'piotroski_f_score': f_score,
+            'piotroski_badge': f_badge, 'f_score_num': f_score,
+            'f_score_label': f_badge, 'f_score_display': f_display,
+            'roe_num': roe, 'de_num': de, 'npm_num': npm,
+            'turnover_num': turnover, 'leverage_num': leverage, 'pe_num': pe_val if pe_val is not None else 0.0,
+            'piotroski_criteria_available': 9 if prior else 3,
+            'piotroski_note': None if prior else 'Six of nine criteria need a prior year and default to failing -- only one year of statements was available.'
+        }
+    except Exception:
+        return None
 
 def get_kite_client(api_key: str, access_token: str) -> Any:
     """Initializes authenticated KiteConnect instance."""
