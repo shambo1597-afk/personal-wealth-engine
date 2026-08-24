@@ -445,6 +445,88 @@ class TestStructuredFundamentals:
         assert res['piotroski_note'] is not None
 
 
+class TestNonEquityFundExemption:
+    """
+    Regression tests for a real gap found while the user was syncing a live 854-ticker
+    universe: ETFs, REITs, InvITs, and the sovereign-debt anchor were being run through the
+    equity DuPont/Piotroski pipeline, which can never work for them (funds don't file a
+    balance sheet or income statement) -- every one of them fell through to a blocked
+    'Synthetic Estimate' regardless of which fundamentals provider was used. Fixed by
+    exempting them the same way Financial Institutions already are.
+    """
+
+    def test_gold_etf_is_exempted_without_any_network_call(self, monkeypatch):
+        # Must short-circuit before attempting EODHD/yfinance/synthetic at all.
+        import quant_engine
+
+        def _fail(*a, **kw):
+            raise AssertionError("should never attempt a fundamentals lookup for a fund")
+
+        monkeypatch.setattr(quant_engine, 'fetch_yfinance_fundamentals', _fail)
+        res = fetch_structured_company_fundamentals('GOLDBEES.NS')
+        assert res['Data Source'] == 'Not Applicable (Precious Metals (Gold))'
+        assert res['piotroski_f_score'] is None
+        assert res['Piotroski F-Score'] == 'N/A'
+
+    def test_sovereign_bond_anchor_is_exempted(self, monkeypatch):
+        import quant_engine
+        monkeypatch.setattr(quant_engine, 'fetch_yfinance_fundamentals', lambda t: None)
+        res = fetch_structured_company_fundamentals('GILT5YBEES.NS')
+        assert res['Data Source'].startswith('Not Applicable')
+
+    def test_reit_and_invit_are_exempted(self, monkeypatch):
+        import quant_engine
+        monkeypatch.setattr(quant_engine, 'fetch_yfinance_fundamentals', lambda t: None)
+        reit = fetch_structured_company_fundamentals('EMBASSY.NS')
+        invit = fetch_structured_company_fundamentals('PGINVIT.NS')
+        assert reit['Data Source'] == 'Not Applicable (Real Estate (REIT))'
+        assert invit['Data Source'] == 'Not Applicable (Infrastructure (InvIT))'
+
+    def test_generic_index_etf_is_exempted_via_class_map_even_without_a_name_hint(self, monkeypatch):
+        # A ticker like 'NIFTYBEES.NS' can't be recognized as an ETF by name alone (unlike
+        # GOLDBEES/EMBASSY/PGINVIT) -- this must come from the live discovery-time class_map,
+        # which tags every entry in NSE's ETF directory correctly regardless of its name.
+        import quant_engine
+        monkeypatch.setattr(quant_engine, 'fetch_yfinance_fundamentals', lambda t: None)
+        class_map = {'NIFTYBEES.NS': 'Equity ETF (Sec 112A)'}
+        res = fetch_structured_company_fundamentals('NIFTYBEES.NS', class_map=class_map)
+        assert res['Data Source'] == 'Not Applicable (Equity ETF (Sec 112A))'
+
+    def test_real_equity_is_not_exempted(self, monkeypatch):
+        _block_yfinance(monkeypatch)
+        res = fetch_structured_company_fundamentals('TCS.NS', class_map={'TCS.NS': 'Equity Delivery (Sec 112A)'})
+        assert not res['Data Source'].startswith('Not Applicable')
+
+    def test_fund_exemption_passes_the_fscore_gate(self, monkeypatch):
+        # The whole point: an exempted fund must show up as tradeable, not blocked.
+        import quant_engine
+        monkeypatch.setattr(quant_engine, 'fetch_yfinance_fundamentals', lambda t: None)
+        tickers = ['GOLDBEES.NS', 'TCS.NS']
+        fundamentals_df = pd.DataFrame([
+            fetch_structured_company_fundamentals('GOLDBEES.NS'),
+            {
+                'Ticker': 'TCS.NS', 'Asset': 'TCS', 'Data Source': 'Yahoo Finance (Audited)',
+                'roe_num': 45.0, 'de_num': 0.05, 'npm_num': 19.0, 'pe_num': 28.0,
+                'piotroski_f_score': 9, 'piotroski_badge': '🟢 Strong (8-9/9)',
+                'Piotroski F-Score': '9/9 ★', 'Fundamental Health': '✅ High Quality (Audited)',
+            },
+        ])
+        rng = np.random.default_rng(11)
+        n = 300
+        price_hist = pd.DataFrame(
+            np.cumprod(1 + rng.normal(0.0006, 0.012, (n, len(tickers))), axis=0) * 100,
+            columns=tickers,
+        )
+        vol_hist = pd.DataFrame(rng.integers(100000, 500000, (n, len(tickers))), columns=tickers)
+        adtv_series = pd.Series({t: 2e8 for t in tickers})
+        by_ticker = compute_multifactor_rankings(
+            price_hist, tickers, fundamentals_df,
+            volume_history_df=vol_hist, adtv_series=adtv_series,
+        ).set_index('Ticker')
+        assert by_ticker.loc['GOLDBEES.NS', 'Data_Available'] == True
+        assert by_ticker.loc['GOLDBEES.NS', 'F_Score_Safe'] == True
+
+
 class _MockYfTicker:
     """Stands in for yfinance.Ticker -- carries pre-built statement DataFrames and .info."""
     def __init__(self, balance_sheet, income_stmt, cashflow, info=None):

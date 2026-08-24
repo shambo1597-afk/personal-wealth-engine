@@ -1466,7 +1466,7 @@ with tab_dupont:
         with st.spinner("Ingesting audited financial statements via structured REST pipeline..."):
             synced_df = sync_structured_fundamentals_for_universe(
                 sync_universe, api_key=structured_api_key or None, provider='EODHD',
-                progress_callback=_on_sync_progress
+                progress_callback=_on_sync_progress, class_map=live_class_map
             )
         sync_progress.progress(1.0, text="Sync complete.")
 
