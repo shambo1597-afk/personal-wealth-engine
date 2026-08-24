@@ -11,12 +11,22 @@ from config import SOVEREIGN_BOND_TICKER, get_market_time_horizons, HEALTH_AND_E
 
 # ----------------------------------------------------------------------------------------------------
 # 1. STATUTORY TAX CONSTANTS & THRESHOLDS (BUDGET 2024–2026 / FINANCE ACT)
+#
+# CAVEAT -- SURCHARGE IS NOT MODELED. The rates below apply only the 4% Health & Education
+# Cess. Indian income tax law also applies a surcharge on top of the base rate once total
+# income (not just capital gains) crosses ₹50L/1Cr/2Cr thresholds (10%/15%/25% slabs for
+# individuals, with a surcharge cap specific to Sec 111A/112A gains). This engine has no way
+# to know a user's total income, so it cannot compute that surcharge, and every number this
+# module produces UNDERSTATES actual tax liability for anyone above the ₹50L total-income
+# threshold. Treat every "tax payable" figure from this engine as a floor, not a final number
+# -- verify against a CA or the actual ITR computation before relying on it, especially near
+# a filing deadline or a large realized gain.
 # ----------------------------------------------------------------------------------------------------
 SEC_112A_BASE_RATE        = 0.125      # 12.5% Statutory Base Long-Term Capital Gains Rate (Sec 112A)
 SEC_111A_BASE_RATE        = 0.200      # 20.0% Statutory Base Short-Term Capital Gains Rate (Sec 111A)
 SEC_50AA_BASE_RATE        = 0.300      # 30.0% Statutory Slab Rate for Specified Debt Funds (Sec 50AA)
 
-# Effective Tax Rates Inclusive of 4% Health & Education Cess
+# Effective Tax Rates Inclusive of 4% Health & Education Cess ONLY -- see surcharge caveat above.
 SEC_112A_TAX_RATE         = SEC_112A_BASE_RATE * (1.0 + HEALTH_AND_EDUCATION_CESS)  # 13.0% (0.130)
 SEC_111A_TAX_RATE         = SEC_111A_BASE_RATE * (1.0 + HEALTH_AND_EDUCATION_CESS)  # 20.8% (0.208)
 SEC_50AA_TAX_RATE         = SEC_50AA_BASE_RATE * (1.0 + HEALTH_AND_EDUCATION_CESS)  # 31.2% (0.312)

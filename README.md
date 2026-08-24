@@ -21,6 +21,7 @@ A comprehensive, institutional-grade Personal Wealth Management and Quantitative
 - **Capital Gains Computation**: Short-Term Capital Gains (STCG) and Long-Term Capital Gains (LTCG) across Equity, Debt, and Real Estate as per latest Indian Income Tax rules.
 - **Section 112A & Grandfathering Support**: Optimized tracking of ₹1.25 Lakh LTCG annual equity exemption limit.
 - **Tax Harvesting Simulator**: Identify unrealized losses and gains to execute tax-loss harvesting before financial year-end (March 31st).
+- ⚠️ **Surcharge is not modeled.** Every tax figure includes the 4% Health & Education Cess but not the income-based surcharge (10%/15%/25% slabs above ₹50L/1Cr/2Cr total income). This engine has no way to know your total income, so numbers above the ₹50L threshold understate your real liability — treat them as a floor, not a final number, and verify with a CA.
 
 ### 4. 📈 Interactive Analytics & Dashboards (`app.py`)
 - Visual interactive charts powered by **Plotly**.
@@ -70,8 +71,9 @@ The application will open automatically in your default browser at `http://local
 ---
 
 ## 🔒 Security & Privacy
-- **100% Local**: All portfolio data, transactions, and personal financial numbers remain securely on your local machine in SQLite.
+- **100% Local**: this app never sends your portfolio data anywhere over the network -- it's a claim about network exposure, not encryption. All portfolio data, transactions, and personal financial numbers are stored in `wealth_ledger.db`, an **unencrypted** SQLite file. Anyone with access to that file -- another user on a shared machine, a cloud-sync tool (Dropbox/OneDrive/Google Drive) if the app's folder sits inside a synced directory, or someone who gets hold of the machine -- can read it in plaintext. Keep it out of synced folders, or encrypt the disk/folder yourself if that's a real threat for you.
 - Sensitive files (`*.db`, `*.wal`, `.env`) are excluded from Git via `.gitignore`.
+- Zerodha Kite API credentials are entered per-session via a password-masked field and are never written to disk or the database.
 
 ---
 

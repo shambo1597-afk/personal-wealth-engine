@@ -1,0 +1,18 @@
+version: 2
+updates:
+  # Python dependencies (requirements.txt / requirements-dev.txt). Dependabot
+  # ignores our -lock.txt files (it doesn't understand the pip-freeze pinning
+  # convention used here) and opens PRs against the loose ranges instead --
+  # bump the corresponding *-lock.txt by hand in the same PR before merging,
+  # using the regeneration steps documented in the lock file headers.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 5
+
+  # GitHub Actions used by ci.yml.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
