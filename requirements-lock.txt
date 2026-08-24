@@ -35,7 +35,7 @@ MarkupSafe==3.0.3
 multitasking==0.0.13
 narwhals==2.25.0
 nselib==2.5.1
-numpy==2.4.6
+numpy==2.5.2
 packaging==26.3
 pandas==3.0.5
 pandas_market_calendars==5.4.0
