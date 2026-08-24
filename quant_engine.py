@@ -1015,8 +1015,9 @@ def _fetch_single_fundamental(ticker: str) -> Dict[str, Any]:
     clean_sym = ticker.replace('.NS', '').replace('.BO', '').strip()
     full_tk = f"{clean_sym}.NS"
     now_utc = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+    is_curated = full_tk in VERIFIED_INDIAN_FUNDAMENTALS
 
-    if full_tk in VERIFIED_INDIAN_FUNDAMENTALS:
+    if is_curated:
         m = VERIFIED_INDIAN_FUNDAMENTALS[full_tk]
         roe = float(m['roe'])
         npm = float(m['npm'])
@@ -1025,7 +1026,7 @@ def _fetch_single_fundamental(ticker: str) -> Dict[str, Any]:
         de = float(m['de'])
         pe = float(m['pe'])
         f_score = int(m['f_score'])
-        health = str(m['health'])
+        health = str(m['health']).replace('(Audited)', '(Unverified Estimate)')
     else:
         # Deterministic generation based on symbol hash to guarantee realistic variance
         h_val = int(abs(hash(clean_sym))) % 1000
@@ -1068,15 +1069,27 @@ def _fetch_single_fundamental(ticker: str) -> Dict[str, Any]:
             f_score = 6 + (h_val % 4)
 
         roe = npm * turnover * leverage
-        health = '✅ High Quality (Audited)' if (de < 0.70 and roe >= 15.0 and f_score >= 8) else ('🟢 Strong Balance Sheet' if f_score >= 8 else '🔵 Moderate Stability')
+        health = '🟡 Unverified Estimate' if (de < 0.70 and roe >= 15.0 and f_score >= 8) else ('🟡 Unverified Estimate' if f_score >= 8 else '🔵 Moderate Stability (Unverified)')
 
     f_badge = "🟢 Strong (8-9/9)" if f_score >= 8 else ("🔵 Moderate (5-7/9)" if f_score >= 5 else "🔴 Weak / Decay (≤4/9)")
     f_display = f"{f_score}/9 ★" if f_score >= 8 else (f"{f_score}/9 ⚠️" if f_score <= 3 else f"{f_score}/9")
 
+    # NEITHER branch above is real audited data pulled from a structured REST filing --
+    # the curated dict is hand-entered reference numbers that go stale, and the else branch
+    # is a deterministic hash of the ticker symbol, not a financial statement. Both must be
+    # labeled so the string 'Audited' never appears here: the Piotroski F-Score safety gate in
+    # compute_multifactor_rankings() treats any 'Audited' substring in this field as verified
+    # data and unblocks trading on it -- mislabeling this as audited would silently let the
+    # gate wave through fabricated numbers for the entire universe.
+    data_source = (
+        'Curated Reference Estimate (Static, Not Verified From Filings)' if is_curated
+        else 'Synthetic Estimate (No API Key — Provide One to Sync Real Filings)'
+    )
+
     return {
         'Ticker': full_tk,
         'Asset': clean_sym,
-        'Data Source': 'Audited REST Ingestion (Parquet)',
+        'Data Source': data_source,
         'sync_error': None,
         'last_synced_utc': now_utc,
         'DuPont ROE (%)': f"{roe:.1f}%",
@@ -1148,9 +1161,17 @@ def fetch_structured_company_fundamentals(ticker: str, api_key: Optional[str] = 
                         f_badge = "🟢 Strong (8-9/9)" if f_score >= 8 else ("🔵 Moderate (5-7/9)" if f_score >= 5 else "🔴 Weak / Decay (≤4/9)")
                         f_display = f"{f_score}/9 ★" if f_score >= 8 else f"{f_score}/9"
                         now_utc = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
-                        
+
+                        # Piotroski's 9-point test assumes an industrial/retail balance sheet
+                        # (inventory turnover, current ratio, etc.) and doesn't cleanly apply to
+                        # banks/NBFCs/insurers -- exempt them from the F-Score gate rather than
+                        # block genuinely audited financial-institution data on a score that was
+                        # never designed for their balance sheet shape.
+                        is_financial = get_asset_sector(ticker) in FINANCIAL_SECTOR_NAMES
+                        data_source_label = 'Not Applicable (Financial Institution)' if is_financial else 'EODHD REST API (Audited)'
+
                         return {
-                            'Ticker': ticker, 'Asset': clean_sym, 'Data Source': 'EODHD REST API (Audited)',
+                            'Ticker': ticker, 'Asset': clean_sym, 'Data Source': data_source_label,
                             'sync_error': None, 'last_synced_utc': now_utc,
                             'DuPont ROE (%)': f"{roe:.1f}%", 'Net Profit Margin (%)': f"{npm:.1f}%",
                             'Asset Turnover (x)': f"{turnover:.2f}x", 'Financial Leverage (x)': f"{leverage:.2f}x",

@@ -111,6 +111,11 @@ with st.sidebar.expander("🔐 Zerodha Kite Connect Sync (Optional)", expanded=F
                 kite_holdings, kite_margins, kite_quotes = sync_zerodha_live_data(kite_client, list(SECTOR_MAP.keys()))
                 if kite_holdings:
                     st.caption(f"💼 Synced **{len(kite_holdings)}** Demat holdings | Available Margin: **₹{kite_margins:,.2f}**")
+                    st.caption(
+                        "⚠️ Kite's holdings API doesn't report your original purchase date -- any lot created here "
+                        "(new positions only; existing lots keep their real date) is stamped with **today's date**, "
+                        "which will misclassify it as STCG until you correct the buy date from your contract note/tradebook."
+                    )
                     if st.button("📥 Sync Demat Holdings to Database Lots"):
                         with get_db_connection() as conn:
                             k_res = sync_kite_holdings_to_tax_lots(kite_holdings, conn, mode='Merge New Trades (Incremental)')
@@ -293,7 +298,7 @@ live_quant = solve_portfolio_in_memory(
     max_retail_cap=MAX_RETAIL_CAP,
     shrunk_cov=master_data.get('live_shrunk_cov'),
     mean_returns=master_data.get('live_mean_returns'),
-    sector_map=SECTOR_MAP
+    sector_map=live_sector_map
 )
 live_quant['bench_returns'] = master_data['bench_live_rets']
 live_quant['multifactor_scorecard'] = master_data['live_scorecard']
@@ -310,7 +315,7 @@ bt_quant = solve_portfolio_in_memory(
     max_retail_cap=MAX_RETAIL_CAP,
     shrunk_cov=master_data.get('bt_shrunk_cov'),
     mean_returns=master_data.get('bt_mean_returns'),
-    sector_map=SECTOR_MAP
+    sector_map=live_sector_map
 )
 bt_quant['multifactor_scorecard'] = master_data['bt_scorecard']
 bt_quant['top_20_equities'] = master_data['top_20_bt_equities']
@@ -1396,13 +1401,19 @@ with tab_dupont:
     st.caption("ℹ️ **Integrated Quantitative Screening Engine:** Combines 90-Day ADTV Liquidity Gate (≥₹10 Cr), 3-Stage DuPont Quality (Margin × Turnover × Leverage), 12M-1M Momentum, 60D Realized Volatility Penalty, and Institutional Volume Accumulation ($Z_{accum}$) with Forensic Governance Circuit Breakers.")
     st.info(
         "💡 **Fundamentals Architecture:** Audited balance sheets, income statements, and cash-flow filings are ingested via "
-        "structured REST payloads (EODHD / FMP / Parquet Store) with zero brittle HTML web scraping. DuPont 3-Stage decomposition "
-        "and 9-point Piotroski F-Scores are calculated and persisted directly in `data/fundamentals.parquet`."
+        "a structured REST payload (EODHD) with zero brittle HTML web scraping, computing real DuPont 3-Stage decomposition "
+        "and 9-point Piotroski F-Scores. **Without an API key below, no audited data exists to sync** -- the Piotroski "
+        "safety gate then blocks every ticker from fresh capital allocation rather than trade on estimated numbers."
     )
 
     # -------------------------------------------------------------------------
     # 0. AUDITED STRUCTURED REST INGESTION SYNC
     # -------------------------------------------------------------------------
+    structured_api_key = st.text_input(
+        "EODHD API Key (required for real audited data):", type="password",
+        key="structured_fundamentals_api_key",
+        help="Without a key, syncing only persists clearly-labeled estimates that the Piotroski F-Score gate will not trade on."
+    )
     _last_synced = get_fundamentals_last_synced()
     sync_col1, sync_col2 = st.columns([1, 2])
     with sync_col1:
@@ -1415,7 +1426,10 @@ with tab_dupont:
 
     _last_sync_summary = st.session_state.get('last_structured_sync_summary')
     if _last_sync_summary:
-        st.success(_last_sync_summary['message'])
+        if _last_sync_summary.get('audited'):
+            st.success(_last_sync_summary['message'])
+        else:
+            st.warning(_last_sync_summary['message'])
         del st.session_state['last_structured_sync_summary']
 
     if sync_clicked:
@@ -1428,13 +1442,26 @@ with tab_dupont:
 
         with st.spinner("Ingesting audited financial statements via structured REST pipeline..."):
             synced_df = sync_structured_fundamentals_for_universe(
-                sync_universe, progress_callback=_on_sync_progress
+                sync_universe, api_key=structured_api_key or None, provider='EODHD',
+                progress_callback=_on_sync_progress
             )
         sync_progress.progress(1.0, text="Sync complete.")
 
         if not synced_df.empty:
+            audited_count = int(synced_df['Data Source'].astype(str).str.contains('Audited|Not Applicable', regex=True).sum()) if 'Data Source' in synced_df.columns else 0
+            if structured_api_key:
+                msg = f"✅ Successfully ingested and persisted audited fundamentals for {audited_count}/{len(synced_df)} tickers to data/fundamentals.parquet."
+                if audited_count < len(synced_df):
+                    msg += f" {len(synced_df) - audited_count} ticker(s) failed the EODHD lookup and were persisted as unaudited estimates -- they remain blocked by the F-Score gate until re-synced."
+            else:
+                msg = (
+                    f"⚠️ No API key provided -- persisted {len(synced_df)} tickers as clearly-labeled estimates, "
+                    "not audited data. Every one of them remains blocked by the Piotroski F-Score safety gate. "
+                    "Enter your EODHD API key above and sync again to unlock real audited scoring."
+                )
             st.session_state['last_structured_sync_summary'] = {
-                'message': f"✅ Successfully ingested and persisted audited fundamentals for {len(synced_df)} tickers to data/fundamentals.parquet."
+                'audited': bool(structured_api_key),
+                'message': msg
             }
         st.cache_data.clear()
         st.rerun()
