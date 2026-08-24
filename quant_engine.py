@@ -918,6 +918,46 @@ def ensure_market_data_dir() -> None:
 # ----------------------------------------------------------------------------------------------------
 FINANCIAL_SECTOR_NAMES = {'Financials'}
 
+# Asset classes get_asset_class() can return that are funds/trusts, not operating companies --
+# DuPont ROE and the Piotroski F-Score are computed from a company's own balance sheet, income
+# statement, and cash flow, none of which a passive ETF, REIT, or InvIT files. Every one of these
+# was structurally guaranteed to fail on any fundamentals provider (EODHD, Yahoo Finance, or a
+# future replacement) and fall to a blocked 'Synthetic Estimate' -- not a data-quality problem,
+# a category-mismatch problem. Exempted the same way Financial Institutions already are.
+NON_EQUITY_ASSET_CLASSES = {
+    'Precious Metals (Gold)', 'Precious Metals (Silver)',
+    'Sovereign Debt ETF (Sec 50AA)', 'Liquid Debt ETF (Sec 50AA)',
+    'Real Estate (REIT)', 'Infrastructure (InvIT)',
+    'Equity ETF (Sec 112A)',
+}
+
+
+def _fund_not_applicable_row(ticker: str, asset_class: str) -> Dict[str, Any]:
+    """
+    Returns a well-formed fundamentals row for an ETF/REIT/InvIT/sovereign-debt instrument --
+    same shape as every other provider's row, but with the equity-only metrics left as N/A
+    rather than computed from data that doesn't exist for a fund, and exempted from the
+    F-Score gate via the same 'Not Applicable' Data Source convention used for banks.
+    """
+    clean_sym = ticker.replace('.NS', '').strip()
+    now_utc = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+    return {
+        'Ticker': ticker, 'Asset': clean_sym,
+        'Data Source': f'Not Applicable ({asset_class})',
+        'sync_error': None, 'last_synced_utc': now_utc,
+        'DuPont ROE (%)': 'N/A', 'Net Profit Margin (%)': 'N/A',
+        'Asset Turnover (x)': 'N/A', 'Financial Leverage (x)': 'N/A',
+        'Debt / Equity': 'N/A', 'P/E Ratio': 'N/A',
+        'Fundamental Health': f'Not Applicable ({asset_class})',
+        'Piotroski F-Score': 'N/A', 'piotroski_f_score': None,
+        'piotroski_badge': 'N/A', 'f_score_num': None,
+        'f_score_label': 'N/A', 'f_score_display': 'N/A',
+        'roe_num': None, 'de_num': None, 'npm_num': None,
+        'turnover_num': None, 'leverage_num': None, 'pe_num': None,
+        'piotroski_criteria_available': 0,
+        'piotroski_note': f'{asset_class} is a fund/trust, not an operating company -- DuPont/Piotroski do not apply.',
+    }
+
 VERIFIED_INDIAN_FUNDAMENTALS: Dict[str, Dict[str, Any]] = {
     'TCS.NS': {'roe': 48.5, 'npm': 19.8, 'turnover': 1.15, 'leverage': 2.13, 'de': 0.05, 'pe': 28.5, 'f_score': 9, 'health': '✅ High Quality (Audited)'},
     'INFY.NS': {'roe': 31.8, 'npm': 17.4, 'turnover': 1.05, 'leverage': 1.74, 'de': 0.08, 'pe': 25.2, 'f_score': 8, 'health': '✅ High Quality (Audited)'},
@@ -1082,9 +1122,17 @@ def _fetch_single_fundamental(ticker: str) -> Dict[str, Any]:
         'piotroski_note': None
     }
 
-def fetch_structured_company_fundamentals(ticker: str, api_key: Optional[str] = None, provider: str = 'EODHD') -> Dict[str, Any]:
+def fetch_structured_company_fundamentals(
+    ticker: str, api_key: Optional[str] = None, provider: str = 'EODHD',
+    class_map: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
     """
     Fetches real, audited financial statements for a ticker, in priority order:
+      0. If the ticker is an ETF/REIT/InvIT/sovereign-debt instrument (per class_map, or a ticker-
+         name heuristic if no class_map is given), short-circuit immediately -- these are funds/
+         trusts, not operating companies, so DuPont ROE and the Piotroski F-Score are structurally
+         inapplicable to them regardless of provider. Exempted rather than left to fail and get
+         blocked as if their data were simply missing.
       1. EODHD structured REST API, only if api_key is given and provider='EODHD'. Field names
          (netIncome, totalStockholderEquity, PERatio, etc.) are UNVERIFIED against a live
          response (this environment has no eodhd.com network access or test key) -- and in
@@ -1099,8 +1147,12 @@ def fetch_structured_company_fundamentals(ticker: str, api_key: Optional[str] = 
     criterion is a real audited-filing check or a real year-over-year comparison, never a
     hardcoded pass; with only one year of filings, the YoY criteria fail closed.
     """
+    asset_class = get_asset_class(ticker, class_map=class_map)
+    if asset_class in NON_EQUITY_ASSET_CLASSES:
+        return _fund_not_applicable_row(ticker, asset_class)
+
     clean_sym = ticker.replace('.NS', '').strip()
-    
+
     # If API Key is provided, query structured REST JSON endpoint
     if api_key:
         try:
@@ -1433,6 +1485,7 @@ def sync_structured_fundamentals_for_universe(
     provider: str = 'EODHD',
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     fundamentals_path: Optional[str] = None,
+    class_map: Optional[Dict[str, str]] = None,
 ) -> pd.DataFrame:
     """
     Ingests audited structured financial data for the universe and saves to data/fundamentals.parquet.
@@ -1441,7 +1494,7 @@ def sync_structured_fundamentals_for_universe(
     total = len(tickers_list)
     rows = []
     for i, t in enumerate(tickers_list):
-        row = fetch_structured_company_fundamentals(t, api_key=api_key, provider=provider)
+        row = fetch_structured_company_fundamentals(t, api_key=api_key, provider=provider, class_map=class_map)
         rows.append(row)
         if progress_callback is not None:
             try:
@@ -1480,6 +1533,7 @@ def fetch_universe_fundamentals(
     sector_map: Optional[Dict[str, str]] = None,
     turbo_mode: bool = False,
     fundamentals_path: Optional[str] = None,
+    class_map: Optional[Dict[str, str]] = None,
 ) -> pd.DataFrame:
     """
     Loads universe fundamentals from data/fundamentals.parquet. If missing or incomplete,
@@ -1493,7 +1547,7 @@ def fetch_universe_fundamentals(
     cached_df = load_local_parquet_fundamentals(fundamentals_path=path, max_age_days=36500)
 
     if cached_df is None or cached_df.empty or 'Ticker' not in cached_df.columns:
-        cached_df = sync_structured_fundamentals_for_universe(tickers_list, fundamentals_path=path)
+        cached_df = sync_structured_fundamentals_for_universe(tickers_list, fundamentals_path=path, class_map=class_map)
 
     cached_by_ticker = cached_df.set_index('Ticker') if (cached_df is not None and not cached_df.empty) else pd.DataFrame()
     rows = []
@@ -1509,7 +1563,7 @@ def fetch_universe_fundamentals(
 
     if missing:
         for t in missing:
-            row = fetch_structured_company_fundamentals(t)
+            row = fetch_structured_company_fundamentals(t, class_map=class_map)
             rows.append(row)
         df_full = pd.DataFrame(rows)
         save_local_parquet_fundamentals(df_full, fundamentals_path=path)
@@ -1714,17 +1768,15 @@ def compute_multifactor_rankings(
     # 8. Composite Multi-Factor Score: 35% Quality, 35% Momentum, 15% Volatility Penalty, 15% Institutional Accumulation
     composite_score = (0.35 * z_qual) + (0.35 * z_mom) + (0.15 * z_vol) + (0.15 * z_accum)
 
-    # A ticker is exempt from the F-Score gate (not blocked purely for lacking one) only when it
-    # is a Financial Institution the score genuinely doesn't apply to -- never for missing data.
+    # A ticker is exempt from the F-Score gate (not blocked purely for lacking one) only when
+    # it's a Financial Institution or a fund/trust (ETF, REIT, InvIT, sovereign debt) the score
+    # genuinely doesn't apply to -- 'Not Applicable (...)' covers both, never for missing data.
     is_data_available = {
-        t: (data_source_series[t] in (
-            'Audited REST Ingestion (Parquet)', 'EODHD REST API (Audited)',
-            'Screener.in (Audited)', 'Not Applicable (Financial Institution)'
-        )) or ('Audited' in str(data_source_series[t]))
+        t: str(data_source_series[t]).startswith('Not Applicable') or ('Audited' in str(data_source_series[t]))
         for t in valid_cols
     }
     is_fscore_safe = {
-        t: (data_source_series[t] == 'Not Applicable (Financial Institution)')
+        t: str(data_source_series[t]).startswith('Not Applicable')
            or (pd.notna(f_score_series[t]) and f_score_series[t] > 3)
         for t in valid_cols
     }
@@ -2524,7 +2576,7 @@ def fetch_master_market_data(
         bench_series = valid_assets[top_cols].mean(axis=1) if top_cols else valid_assets.mean(axis=1)
 
     bench_series = bench_series.reindex(valid_assets.index).ffill().bfill()
-    universe_fundamentals = fetch_universe_fundamentals(tickers_list, sector_map=live_sector_map, turbo_mode=turbo_mode)
+    universe_fundamentals = fetch_universe_fundamentals(tickers_list, sector_map=live_sector_map, turbo_mode=turbo_mode, class_map=live_class_map)
     sma_200_series = valid_assets.rolling(200).mean().iloc[-1]
 
     live_assets = valid_assets.loc[valid_assets.index >= pd.to_datetime(live_train_start_str)]
