@@ -95,6 +95,9 @@ st.sidebar.title("⚙️ Engine Controls")
 st.sidebar.markdown("Configure personal wealth targets, investor profile, broker liquidity, and optimization models.")
 
 # Zerodha Kite Connect Authentication & Live Sync Expander
+# Deliberately session-only: these live in Streamlit's in-memory widget state for this run and
+# are never written to the SQLite DB or disk anywhere in this file. Do not "fix" this by adding
+# persistence for convenience -- that would turn a live trading credential into an at-rest secret.
 with st.sidebar.expander("🔐 Zerodha Kite Connect Sync (Optional)", expanded=False):
     kite_api_key = st.text_input("Kite API Key:", type="password", help="Your personal Zerodha Developer App API Key")
     kite_access_token = st.text_input("Daily Access Token:", type="password", help="Your 2FA session access token generated today")
@@ -287,6 +290,18 @@ if _valid_assets_for_vintage is not None and not _valid_assets_for_vintage.empty
         st.sidebar.caption(f"🔴 **Price Data As Of:** `{_data_asof_ts.strftime('%d-%b-%Y')}` ({_data_age_days}d old — stale, refresh before trading)")
 if turbo_mode:
     st.sidebar.caption("⚡ **Turbo Mode ON:** reading from local Parquet cache, not a fresh live pull. Toggle it off and rerun before you rely on these numbers for a real order.")
+
+# Universe-discovery health: the NIFTY 500 / ETF directory fetch is cached for 7 days, so a
+# schema change or outage on niftyindices.com/NSE's archive can silently degrade to whatever a
+# fallback produced (or nothing) with no visible difference from a healthy fetch otherwise.
+_discovery_health = st.session_state.get('universe_discovery_health')
+if _discovery_health:
+    if _discovery_health.get('equities_source') == 'failed':
+        st.sidebar.caption("🔴 **Universe Discovery:** live NIFTY 500 fetch failed and no fallback worked -- equity universe may be empty or missing entirely. Check `wealth_engine.log`.")
+    elif _discovery_health.get('equities_source') == 'nselib_fallback':
+        st.sidebar.caption(f"🟡 **Universe Discovery:** primary NIFTY 500 source failed, used nselib fallback ({_discovery_health.get('equities_count', 0)} equities). Check `wealth_engine.log`.")
+    if _discovery_health.get('etf_source') == 'failed':
+        st.sidebar.caption("🟡 **Universe Discovery:** NSE ETF directory fetch failed -- ETFs/gold/silver/sovereign-debt instruments are likely missing from this run's universe.")
 
 # Stage 2: Multi-Factor Scoring & Quality Gates
 p_bar.progress(45, text="📊 Scoring 3-Stage DuPont Quality, 12M Momentum & Piotroski Safety Gates...")
@@ -901,7 +916,12 @@ if final_execute:
     elif st.session_state.get('committed_today', False) and not allow_same_day:
         st.warning("⚠️ **Double-Click Safety Guard Active:** This order basket was already committed. If you intend to execute an additional trade tranche today, please check **'Force Commit Additional Orders'**.")
     else:
-        backup_database()
+        if backup_database() is None:
+            st.warning(
+                "⚠️ **Pre-commit backup failed** (see terminal/console for the error). Proceeding with the "
+                "commit anyway, but you won't have a fresh safety-net snapshot if something goes wrong -- "
+                "consider a manual backup from the 'SQLite Audit & Tax Ledger' tab first."
+            )
         affected_lot_ids = []
         with get_db_connection() as conn:
             cursor = conn.cursor()
@@ -1439,7 +1459,7 @@ with tab_dupont:
                 _synced_dt = datetime.datetime.strptime(_last_synced.replace(' UTC', ''), '%Y-%m-%d %H:%M:%S')
             except (ValueError, AttributeError):
                 pass
-            _sync_age_days = (datetime.datetime.utcnow() - _synced_dt).days if _synced_dt else None
+            _sync_age_days = (datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - _synced_dt).days if _synced_dt else None
             if _sync_age_days is not None and _sync_age_days > 30:
                 st.caption(f"🕒 **Last Synced to Parquet:** `{_last_synced}` ({_sync_age_days}d ago -- consider re-syncing)")
             else:
@@ -1859,6 +1879,7 @@ with tab_dupont:
 with tab_harvest:
     st.subheader("💎 Annual Tax-Harvesting & Capital Gains Center (Section 112A / 111A / 50AA & Budget 2024–2026)")
     st.caption("Enforces statutory Section 70 & 74 intra-head loss set-off rules: STCL offsets both STCG/LTCG; LTCL is strictly restricted to LTCG.")
+    st.caption("⚠️ Every figure below includes the 4% Health & Education Cess but **not surcharge** -- if your total income (not just capital gains) exceeds ₹50L, your actual liability is higher. Treat these as a floor, not a final number; verify with a CA.")
 
     current_fy_year = TODAY.year if TODAY.month >= 4 else TODAY.year - 1
     current_fy_str = f"FY {current_fy_year}-{str(current_fy_year+1)[-2:]}"
@@ -2094,7 +2115,8 @@ with tab_db:
         st.write("")
         if st.button("🗑️ Delete Tax Lot", type="secondary"):
             if not all_db_lots.empty:
-                backup_database()
+                if backup_database() is None:
+                    st.warning("⚠️ **Pre-delete backup failed** (see terminal/console) -- this deletion is not recoverable from an automatic snapshot.")
                 with get_db_connection() as conn:
                     cursor = conn.cursor()
                     cursor.execute("DELETE FROM tax_lots WHERE lot_id = ?", [int(lot_id_to_delete)])

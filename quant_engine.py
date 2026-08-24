@@ -8,6 +8,8 @@ import io
 import ssl
 import json
 import time
+import hashlib
+import logging
 import datetime
 import concurrent.futures
 import urllib.request
@@ -35,6 +37,23 @@ from config import (
     BENCHMARK_TICKER, SOVEREIGN_BOND_TICKER,
     get_market_time_horizons
 )
+
+# Shared with database.py's logger by name so both modules' warnings land in the same
+# wealth_engine.log -- handler setup is idempotent (skipped if database.py already configured
+# this logger), and this module still works standalone if database.py was never imported.
+logger = logging.getLogger('personal_wealth_engine')
+if not logger.handlers:
+    logger.setLevel(logging.WARNING)
+    try:
+        _log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'wealth_engine.log')
+        _file_handler = logging.FileHandler(_log_path, encoding='utf-8')
+        _file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
+        logger.addHandler(_file_handler)
+    except OSError:
+        pass
+    _console_handler = logging.StreamHandler()
+    _console_handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
+    logger.addHandler(_console_handler)
 
 # Direct NSE India Bhavcopy & Official Market Calendar Integrations
 try:
@@ -287,6 +306,8 @@ def fetch_live_dynamic_multiasset_universe(
     candidate_tickers: List[str] = []
     dynamic_sector_map: Dict[str, str] = {}
     dynamic_class_map: Dict[str, str] = {}
+    equities_source = 'live'
+    etf_source = 'live'
 
     # 1. Equities Feed: Official Nifty 500 CSV
     try:
@@ -302,7 +323,9 @@ def fetch_live_dynamic_multiasset_universe(
             candidate_tickers.append(tk)
             dynamic_sector_map[tk] = get_asset_sector(tk, {tk: ind_val})
             dynamic_class_map[tk] = 'Equity Delivery (Sec 112A)'
-    except Exception:
+    except Exception as e:
+        logger.warning("Primary Nifty 500 fetch from niftyindices.com failed, trying nselib fallback: %s", e)
+        equities_source = 'nselib_fallback'
         if NSELIB_AVAILABLE and nse_cm is not None:
             try:
                 dfs = []
@@ -324,8 +347,13 @@ def fetch_live_dynamic_multiasset_universe(
                         candidate_tickers.append(tk)
                         dynamic_sector_map[tk] = get_asset_sector(tk, {tk: ind_val})
                         dynamic_class_map[tk] = 'Equity Delivery (Sec 112A)'
-            except Exception:
-                pass
+                else:
+                    equities_source = 'failed'
+            except Exception as e2:
+                logger.warning("nselib fallback also failed: %s", e2)
+                equities_source = 'failed'
+        else:
+            equities_source = 'failed'
 
     # 2. Liquid ETF & Hybrid Feed: Official NSE ETF Directory
     try:
@@ -356,8 +384,12 @@ def fetch_live_dynamic_multiasset_universe(
                     dynamic_class_map[tk] = 'Equity ETF (Sec 112A)'
                 if tk not in candidate_tickers:
                     candidate_tickers.append(tk)
-    except Exception:
-        pass
+        else:
+            logger.warning("NSE ETF directory fetch returned HTTP %s", resp_etf.status_code)
+            etf_source = 'failed'
+    except Exception as e:
+        logger.warning("NSE ETF directory fetch failed: %s", e)
+        etf_source = 'failed'
 
     # 3. REIT & InvIT Feed: Exchange-listed trusts
     reits_invits = [
@@ -383,6 +415,23 @@ def fetch_live_dynamic_multiasset_universe(
 
     # Deduplicate while preserving discovery sequence
     candidate_tickers = list(dict.fromkeys(candidate_tickers))
+
+    # Side-channel health flag for the UI -- this function's return type is a stable 3-tuple
+    # depended on by several call sites, so rather than break that contract, stash whether the
+    # live feeds actually succeeded in session_state for app.py to surface. On a genuine
+    # st.cache_data cache hit this whole function body doesn't re-run, so the flag correctly
+    # keeps reflecting the last real fetch rather than needing to be recomputed every time.
+    try:
+        equities_count = sum(1 for v in dynamic_class_map.values() if v == 'Equity Delivery (Sec 112A)')
+        st.session_state['universe_discovery_health'] = {
+            'equities_source': equities_source,
+            'etf_source': etf_source,
+            'equities_count': equities_count,
+            'fetched_utc': datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).strftime('%Y-%m-%d %H:%M:%S UTC'),
+        }
+    except Exception:
+        pass  # No real Streamlit ScriptRunContext (e.g. under pytest) -- fine to skip.
+
     return candidate_tickers, dynamic_sector_map, dynamic_class_map
 
 @st.cache_data(ttl=604800, show_spinner=False)
@@ -940,7 +989,7 @@ def _fund_not_applicable_row(ticker: str, asset_class: str) -> Dict[str, Any]:
     F-Score gate via the same 'Not Applicable' Data Source convention used for banks.
     """
     clean_sym = ticker.replace('.NS', '').strip()
-    now_utc = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+    now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).strftime('%Y-%m-%d %H:%M:%S UTC')
     return {
         'Ticker': ticker, 'Asset': clean_sym,
         'Data Source': f'Not Applicable ({asset_class})',
@@ -1021,7 +1070,7 @@ def _fetch_single_fundamental(ticker: str) -> Dict[str, Any]:
     """
     clean_sym = ticker.replace('.NS', '').replace('.BO', '').strip()
     full_tk = f"{clean_sym}.NS"
-    now_utc = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+    now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).strftime('%Y-%m-%d %H:%M:%S UTC')
     is_curated = full_tk in VERIFIED_INDIAN_FUNDAMENTALS
 
     if is_curated:
@@ -1035,8 +1084,12 @@ def _fetch_single_fundamental(ticker: str) -> Dict[str, Any]:
         f_score = int(m['f_score'])
         health = str(m['health']).replace('(Audited)', '(Unverified Estimate)')
     else:
-        # Deterministic generation based on symbol hash to guarantee realistic variance
-        h_val = int(abs(hash(clean_sym))) % 1000
+        # Deterministic generation based on symbol hash to guarantee realistic variance.
+        # Python's builtin hash() is salted per-process (PYTHONHASHSEED) for security reasons
+        # unless explicitly disabled -- it is NOT stable across restarts, which would silently
+        # reshuffle every uncurated ticker's synthetic numbers each time the app launches. Use
+        # a real stable hash instead so the same ticker always produces the same estimate.
+        h_val = int(hashlib.sha256(clean_sym.encode('utf-8')).hexdigest(), 16) % 1000
         sec = get_asset_sector(full_tk)
         
         if sec in ('Information Technology', 'Tech'):
@@ -1211,7 +1264,7 @@ def fetch_structured_company_fundamentals(
 
                         f_badge = "🟢 Strong (8-9/9)" if f_score >= 8 else ("🔵 Moderate (5-7/9)" if f_score >= 5 else "🔴 Weak / Decay (≤4/9)")
                         f_display = f"{f_score}/9 ★" if f_score >= 8 else f"{f_score}/9"
-                        now_utc = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+                        now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).strftime('%Y-%m-%d %H:%M:%S UTC')
 
                         # EODHD's fundamentals payload carries valuation multiples in a separate
                         # 'Highlights' section, not under 'Financials' -- try it, but this hasn't
@@ -1385,7 +1438,7 @@ def fetch_yfinance_fundamentals(ticker: str) -> Optional[Dict[str, Any]]:
         is_financial = get_asset_sector(ticker) in FINANCIAL_SECTOR_NAMES
         f_badge = "🟢 Strong (8-9/9)" if f_score >= 8 else ("🔵 Moderate (5-7/9)" if f_score >= 5 else "🔴 Weak / Decay (≤4/9)")
         f_display = f"{f_score}/9 ★" if f_score >= 8 else f"{f_score}/9"
-        now_utc = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+        now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).strftime('%Y-%m-%d %H:%M:%S UTC')
 
         pe_val = None
         try:

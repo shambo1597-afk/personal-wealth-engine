@@ -35,6 +35,7 @@ venv.bak/
 *.sqlite3
 db_backups/
 data/
+*.log
 
 # Environment Variables & Secrets
 .env

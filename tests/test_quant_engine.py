@@ -9,6 +9,8 @@ from typing import Dict, List
 import numpy as np
 import pandas as pd
 import pytest
+import requests
+import streamlit as st
 
 from config import MAX_RETAIL_CAP, MAX_SECTOR_CAP
 from quant_engine import (
@@ -929,4 +931,32 @@ class TestDynamicMultiAssetDiscovery:
         assert get_asset_class('EMBASSY.NS') == 'Real Estate (REIT)'
         assert get_asset_class('PGINVIT.NS') == 'Infrastructure (InvIT)'
         assert get_asset_class('TCS.NS') == 'Equity Delivery (Sec 112A)'
+
+    def test_live_fetch_failure_flags_staleness_instead_of_looking_healthy(self, monkeypatch):
+        # Regression test: a real risk is niftyindices.com/NSE changing schema or going down
+        # while the 7-day st.cache_data TTL is still valid from an earlier successful fetch --
+        # or, as tested here, the very first fetch failing outright. Either way the caller must
+        # be able to tell "this came from a healthy live fetch" from "this is a failed/degraded
+        # result" rather than the two looking identical.
+        import quant_engine
+
+        def _raise(*a, **kw):
+            raise requests.exceptions.ConnectionError("simulated network failure")
+
+        monkeypatch.setattr(quant_engine.GLOBAL_RESILIENT_SESSION, 'get', _raise)
+        monkeypatch.setattr(quant_engine, 'NSELIB_AVAILABLE', False)
+        monkeypatch.setattr(quant_engine, 'nse_cm', None)
+        fetch_live_dynamic_multiasset_universe.clear()
+
+        candidates, sec_map, cls_map = fetch_live_dynamic_multiasset_universe(turbo_mode=False)
+
+        # The sovereign bond anchor and static REIT/InvIT list are hardcoded fallbacks, so the
+        # function never returns a totally empty universe even when every live feed fails --
+        # but the equities feed genuinely is empty, and the health flag must say so.
+        assert 'Equity Delivery (Sec 112A)' not in cls_map.values()
+        health = st.session_state.get('universe_discovery_health')
+        assert health is not None
+        assert health['equities_source'] == 'failed'
+        assert health['etf_source'] == 'failed'
+        assert health['equities_count'] == 0
 

@@ -7,6 +7,7 @@ import os
 import io
 import sqlite3
 import datetime
+import logging
 import collections
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -19,6 +20,25 @@ from config import (
     EQUITY_DELIVERY_FRICTION, ETF_DEBT_GOLD_FRICTION, DP_CHARGE_FLAT_INR,
     get_market_time_horizons, TODAY, TODAY_STR, TODAY_ISO
 )
+
+# A print() to stdout is invisible in a Streamlit app launched by double-clicking run_app.bat on
+# Windows -- there's no visible console to read it from. Route backup failures (which matter: a
+# silent backup failure right before a destructive DB write leaves the user with no safety net
+# and no idea it happened) to a log file next to the DB as well as the console, so there's always
+# somewhere to look after the fact even if the in-app st.warning() was missed or dismissed.
+logger = logging.getLogger('personal_wealth_engine')
+if not logger.handlers:
+    logger.setLevel(logging.WARNING)
+    _log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'wealth_engine.log')
+    try:
+        _file_handler = logging.FileHandler(_log_path, encoding='utf-8')
+        _file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
+        logger.addHandler(_file_handler)
+    except OSError:
+        pass  # Read-only filesystem or similar -- console handler below still works.
+    _console_handler = logging.StreamHandler()
+    _console_handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
+    logger.addHandler(_console_handler)
 
 # ----------------------------------------------------------------------------------------------------
 # 1. DATABASE INITIALIZATION & CONNECTION POOL (WAL & THREAD-SAFE CONFIGURATION)
@@ -101,7 +121,7 @@ def create_database_backup(db_file: str = DB_FILE, backup_dir: str = 'db_backups
         dst = sqlite3.connect(backup_path)
         src.backup(dst)
     except Exception as e:
-        print(f"Warning: Failed to create database backup: {e}")
+        logger.warning("Failed to create database backup: %s", e)
         return None
     finally:
         if dst is not None:
@@ -144,7 +164,7 @@ def backup_database(db_file: str = DB_FILE, backup_file: str = 'db_backups/wealt
         dst = sqlite3.connect(backup_file)
         src.backup(dst)
     except Exception as e:
-        print(f"Warning: Failed to backup database to {backup_file}: {e}")
+        logger.warning("Failed to backup database to %s: %s", backup_file, e)
         return None
     finally:
         if dst is not None:
