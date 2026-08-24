@@ -327,7 +327,20 @@ class TestStructuredFundamentals:
         assert res['piotroski_f_score'] == 9
         assert res['roe_num'] > 40.0
         assert res['de_num'] <= 0.10
-        assert 'Audited' in res['Data Source']
+        # Curated reference numbers are not pulled from a live audited filing -- the F-Score
+        # safety gate treats the substring 'Audited' as verified data, so this must never appear
+        # here for anything less than a real structured REST payload.
+        assert 'Audited' not in res['Data Source']
+
+    def test_curated_and_synthetic_fallbacks_never_pass_as_audited(self):
+        # Neither the hand-curated dict nor the ticker-hash fallback is real audited data --
+        # both must be excluded from the F-Score safety gate's 'Audited' substring check, so a
+        # fresh install without a structured API key blocks the whole universe instead of
+        # silently trading on fabricated numbers.
+        curated = fetch_structured_company_fundamentals('TCS.NS')
+        synthetic = fetch_structured_company_fundamentals('XYZ_UNKNOWN.NS')
+        assert 'Audited' not in curated['Data Source']
+        assert 'Audited' not in synthetic['Data Source']
 
     def test_verified_indian_fundamentals_reliance(self):
         res = fetch_structured_company_fundamentals('RELIANCE.NS')
@@ -472,8 +485,7 @@ class TestMultifactorRankingsFundamentalsGating:
     Verifies compute_multifactor_rankings' buy-eligibility gate with structured fundamentals.
     """
 
-    def _scorecard(self):
-        tickers = ['TCS.NS', 'HDFCBANK.NS']
+    def _price_and_volume(self, tickers):
         rng = np.random.default_rng(11)
         n = 300
         price_hist = pd.DataFrame(
@@ -482,21 +494,77 @@ class TestMultifactorRankingsFundamentalsGating:
         )
         vol_hist = pd.DataFrame(rng.integers(100000, 500000, (n, len(tickers))), columns=tickers)
         adtv_series = pd.Series({t: 2e8 for t in tickers})
-        fundamentals_df = fetch_universe_fundamentals(tickers)
+        return price_hist, vol_hist, adtv_series
+
+    def _scorecard(self, tickers, fundamentals_df):
+        price_hist, vol_hist, adtv_series = self._price_and_volume(tickers)
         return compute_multifactor_rankings(
             price_hist, tickers, fundamentals_df,
             volume_history_df=vol_hist, adtv_series=adtv_series,
         ).set_index('Ticker')
 
+    def test_ticker_with_no_synced_fundamentals_is_blocked_not_faked(self, tmp_path):
+        # A fresh install (or a sync with no structured API key configured) must never let a
+        # ticker trade on curated/synthetic estimate data -- it should show up as genuinely
+        # blocked ("we don't know"), not silently pass the F-Score gate as if it were audited.
+        tickers = ['TCS.NS', 'HDFCBANK.NS']
+        fundamentals_df = fetch_universe_fundamentals(tickers, fundamentals_path=str(tmp_path / 'fund.parquet'))
+        by_ticker = self._scorecard(tickers, fundamentals_df)
+        assert by_ticker.loc['TCS.NS', 'Data_Available'] == False
+        assert by_ticker.loc['TCS.NS', 'Selection_Status'] == '⛔ Fundamentals Not Synced (Blocked)'
+
     def test_synced_ticker_with_healthy_score_is_eligible(self):
-        by_ticker = self._scorecard()
+        tickers = ['TCS.NS', 'HDFCBANK.NS']
+        # Simulate a genuine post-sync state: real structured REST data persisted for TCS.
+        fundamentals_df = pd.DataFrame([{
+            'Ticker': 'TCS.NS', 'Asset': 'TCS', 'Data Source': 'EODHD REST API (Audited)',
+            'roe_num': 45.0, 'de_num': 0.05, 'npm_num': 19.0, 'pe_num': 28.0,
+            'piotroski_f_score': 9, 'piotroski_badge': '🟢 Strong (8-9/9)',
+            'Piotroski F-Score': '9/9 ★', 'Fundamental Health': '✅ High Quality (Audited)',
+        }])
+        by_ticker = self._scorecard(tickers, fundamentals_df)
         assert by_ticker.loc['TCS.NS', 'Selection_Status'] == '🟢 Selected (Top 20)'
         assert by_ticker.loc['TCS.NS', 'Data_Available'] == True
 
     def test_banking_ticker_is_eligible(self):
-        by_ticker = self._scorecard()
+        tickers = ['TCS.NS', 'HDFCBANK.NS']
+        # A bank exempted from the Piotroski test (industrial-balance-sheet assumptions don't
+        # apply) is still eligible even without a numeric F-Score, per the
+        # 'Not Applicable (Financial Institution)' exemption.
+        fundamentals_df = pd.DataFrame([{
+            'Ticker': 'HDFCBANK.NS', 'Asset': 'HDFCBANK', 'Data Source': 'Not Applicable (Financial Institution)',
+            'roe_num': 17.0, 'de_num': 0.85, 'npm_num': 22.0, 'pe_num': 18.0,
+            'piotroski_f_score': None, 'piotroski_badge': 'N/A',
+            'Piotroski F-Score': 'N/A', 'Fundamental Health': 'Not Applicable (Financial Institution)',
+        }])
+        by_ticker = self._scorecard(tickers, fundamentals_df)
         assert by_ticker.loc['HDFCBANK.NS', 'Data_Available'] == True
         assert by_ticker.loc['HDFCBANK.NS', 'F_Score_Safe'] == True
+
+    def test_eodhd_sync_exempts_financial_institutions_from_fscore_gate(self, monkeypatch):
+        # fetch_structured_company_fundamentals itself (not just the scorecard gate) must label
+        # a bank's real audited REST data as exempt, since a numeric Piotroski F-Score computed
+        # with the generic industrial formula on a bank's balance sheet is meaningless.
+        mock_json = {
+            'Financials': {
+                'Balance_Sheet': {'yearly': {'2024-03-31': {
+                    'totalAssets': '1000000', 'totalStockholderEquity': '120000', 'shortLongTermDebtTotal': '850000',
+                }}},
+                'Income_Statement': {'yearly': {'2024-03-31': {'totalRevenue': '90000', 'netIncome': '20000'}}},
+                'Cash_Flow': {'yearly': {'2024-03-31': {'totalCashFromOperatingActivities': '25000'}}},
+            }
+        }
+
+        class MockResponse:
+            status_code = 200
+            def json(self):
+                return mock_json
+
+        import requests
+        monkeypatch.setattr(requests, 'get', lambda url, timeout=4.0: MockResponse())
+
+        res = fetch_structured_company_fundamentals('HDFCBANK.NS', api_key='TEST_KEY', provider='EODHD')
+        assert res['Data Source'] == 'Not Applicable (Financial Institution)'
 
 
 class TestSolvePortfolioInMemoryHandlesEmptyCandidatePool:
