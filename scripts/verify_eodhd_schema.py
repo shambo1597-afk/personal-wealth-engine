@@ -39,6 +39,14 @@ EXPECTED_FIELDS = [
     "Highlights.PERatio",
 ]
 
+# Substrings EODHD's own error bodies use to describe a plan/subscription
+# restriction (as opposed to a genuinely wrong symbol or exchange code).
+# Real observed example: 403 "Only EOD data allowed for free users." on the
+# Fundamentals endpoint for a free-tier key -- this is the reliable signal,
+# even when *other* endpoints report the same underlying restriction as a
+# generic 404 ("Symbol not found" / "Ticker Not Found" / "Exchange Not Found").
+PLAN_RESTRICTION_MARKERS = ("free user", "free plan", "not allowed", "subscription", "upgrade")
+
 
 def get_path(data, path_parts, latest_key=None):
     cur = data
@@ -54,25 +62,25 @@ def get_path(data, path_parts, latest_key=None):
 
 
 def probe(label, url_no_key, url):
-    """GETs a URL, printing status and returning (status_code, parsed_json_or_None)."""
+    """GETs a URL, printing status/body and returning (status_code, parsed_json_or_None, raw_text)."""
     print(f"--- {label} ---")
     print(f"GET {url_no_key}")
     try:
         resp = requests.get(url, timeout=15.0)
     except requests.RequestException as e:
         print(f"Request failed: {e}\n")
-        return None, None
+        return None, None, ""
     print(f"HTTP {resp.status_code}")
     if resp.status_code != 200:
         print(f"Body (first 300 chars): {resp.text[:300]}\n")
-        return resp.status_code, None
+        return resp.status_code, None, resp.text
     try:
         data = resp.json()
     except ValueError:
         print(f"Non-JSON body (first 300 chars): {resp.text[:300]}\n")
-        return resp.status_code, None
+        return resp.status_code, None, resp.text
     print("OK\n")
-    return resp.status_code, data
+    return resp.status_code, data, resp.text
 
 
 def main():
@@ -88,11 +96,13 @@ def main():
         sys.exit(1)
 
     ticker = f"{args.symbol}.{args.exchange}"
+    all_bodies = []  # (probe_label, raw_text) for every probe run, for the plan-restriction scan below
 
     # Probe 1: the fundamentals endpoint this app actually uses.
     fund_url = f"https://eodhd.com/api/fundamentals/{ticker}?api_token={api_key}&fmt=json"
     fund_url_masked = f"https://eodhd.com/api/fundamentals/{ticker}?api_token=***&fmt=json"
-    fund_status, fund_data = probe("1. Fundamentals endpoint (what the app calls)", fund_url_masked, fund_url)
+    fund_status, fund_data, fund_text = probe("1. Fundamentals endpoint (what the app calls)", fund_url_masked, fund_url)
+    all_bodies.append(("Fundamentals " + ticker, fund_text))
 
     if fund_status == 200 and fund_data:
         inc = ((fund_data.get("Financials") or {}).get("Income_Statement") or {}).get("yearly") or {}
@@ -128,20 +138,23 @@ def main():
     # right and this is specifically a Fundamentals-coverage/plan issue.
     eod_url = f"https://eodhd.com/api/eod/{ticker}?api_token={api_key}&fmt=json&period=d&order=d"
     eod_url_masked = f"https://eodhd.com/api/eod/{ticker}?api_token=***&fmt=json&period=d&order=d"
-    eod_status, eod_data = probe("2. EOD price endpoint (different product, same ticker)", eod_url_masked, eod_url)
+    eod_status, eod_data, eod_text = probe("2. EOD price endpoint (different product, same ticker)", eod_url_masked, eod_url)
+    all_bodies.append(("EOD " + ticker, eod_text))
 
     # Probe 3: does Fundamentals work at all on this key/plan, for a
     # well-covered US ticker? If yes, the key/plan supports Fundamentals in
     # general and this is specifically about NSE/India coverage.
     us_url = f"https://eodhd.com/api/fundamentals/AAPL.US?api_token={api_key}&fmt=json"
     us_url_masked = "https://eodhd.com/api/fundamentals/AAPL.US?api_token=***&fmt=json"
-    us_status, _ = probe("3. Fundamentals endpoint for AAPL.US (sanity check on the key/plan)", us_url_masked, us_url)
+    us_status, _, us_text = probe("3. Fundamentals endpoint for AAPL.US (sanity check on the key/plan)", us_url_masked, us_url)
+    all_bodies.append(("Fundamentals AAPL.US", us_text))
 
     # Probe 4: what does EODHD's own NSE symbol directory say this ticker's
     # code actually is? Authoritative rather than guessing at suffixes.
     list_url = f"https://eodhd.com/api/exchange-symbol-list/{args.exchange}?api_token={api_key}&fmt=json"
     list_url_masked = f"https://eodhd.com/api/exchange-symbol-list/{args.exchange}?api_token=***&fmt=json"
-    list_status, list_data = probe(f"4. {args.exchange} exchange symbol directory (authoritative ticker codes)", list_url_masked, list_url)
+    list_status, list_data, list_text = probe(f"4. {args.exchange} exchange symbol directory (authoritative ticker codes)", list_url_masked, list_url)
+    all_bodies.append((f"Exchange list {args.exchange}", list_text))
     if list_status == 200 and isinstance(list_data, list):
         matches = [row for row in list_data if str(row.get("Code", "")).upper() == args.symbol.upper()]
         if matches:
@@ -151,20 +164,36 @@ def main():
                   f"({len(list_data)} symbols listed). Check spelling, or this exchange code may be wrong.\n")
 
     print("=== DIAGNOSIS ===")
-    if eod_status is None or us_status is None or list_status is None:
+
+    # Check every probe's raw body for EODHD's own plan-restriction language
+    # FIRST -- an explicit "only EOD data allowed for free users" (real
+    # observed response) is a stronger, more specific signal than any
+    # generic 404, even when other probes also 404 for the same underlying
+    # reason with vaguer wording ("Symbol/Ticker/Exchange Not Found").
+    plan_hits = [
+        label for label, text in all_bodies
+        if text and any(marker in text.lower() for marker in PLAN_RESTRICTION_MARKERS)
+    ]
+    if plan_hits:
+        print(f"EODHD's own response explicitly cites a plan/subscription restriction (seen on: {', '.join(plan_hits)}).")
+        print("=> This key is on a plan that doesn't include Fundamentals data and/or NSE/India coverage.")
+        print("   The other endpoints' generic 404s ('Symbol/Ticker/Exchange Not Found') are almost")
+        print("   certainly the SAME restriction reported with vaguer wording, not a format problem.")
+        print("   This needs an EODHD plan upgrade (Fundamentals + India/NSE coverage), not a code fix.")
+    elif eod_status is None or us_status is None or list_status is None:
         print("One or more probes never got an HTTP response at all (network/proxy/DNS failure, not a")
         print("4xx from EODHD) -- the reasoning below only applies to probes that got a real HTTP status;")
         print("re-run this on a connection that can actually reach eodhd.com.")
-    if eod_status == 200 and us_status == 200:
+    elif eod_status == 200 and us_status == 200:
         print("EOD prices work for this exact ticker, and Fundamentals works for a US ticker on this key.")
         print("=> Your plan's Fundamentals product likely does NOT include NSE/India coverage.")
         print("   Check your EODHD account's Fundamentals coverage/add-ons at eodhd.com -- this is a")
         print("   billing/plan limitation, not a bug in this app's code.")
-    elif eod_status is not None and eod_status != 200:
+    elif eod_status != 200:
         print(f"Even the EOD price endpoint returned HTTP {eod_status} for {ticker!r}.")
         print("=> The ticker/exchange format itself is likely wrong for this account, or the key is invalid")
         print("   for this ticker's exchange. Check probe 4's directory results above for the real code.")
-    elif us_status is not None and us_status != 200:
+    elif us_status != 200:
         print(f"Fundamentals failed even for AAPL.US (HTTP {us_status}).")
         print("=> Your plan/key may not include Fundamentals data at all -- check your EODHD subscription.")
     else:
