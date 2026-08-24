@@ -1431,7 +1431,19 @@ with tab_dupont:
         sync_clicked = st.button("🔄 Sync Audited Structured Financials", type="primary")
     with sync_col2:
         if _last_synced:
-            st.caption(f"🕒 **Last Synced to Parquet:** `{_last_synced}`")
+            # The cache never expires on its own -- audited annual filings only change
+            # once a year, so there's no need to re-sync often, but nothing else will
+            # ever tell you it's gone stale either. Nudge rather than block.
+            _synced_dt = None
+            try:
+                _synced_dt = datetime.datetime.strptime(_last_synced.replace(' UTC', ''), '%Y-%m-%d %H:%M:%S')
+            except (ValueError, AttributeError):
+                pass
+            _sync_age_days = (datetime.datetime.utcnow() - _synced_dt).days if _synced_dt else None
+            if _sync_age_days is not None and _sync_age_days > 30:
+                st.caption(f"🕒 **Last Synced to Parquet:** `{_last_synced}` ({_sync_age_days}d ago -- consider re-syncing)")
+            else:
+                st.caption(f"🕒 **Last Synced to Parquet:** `{_last_synced}`")
         else:
             st.caption("🟢 **Parquet Store Active:** Ready for instant multi-factor scoring and DuPont analytics.")
 
