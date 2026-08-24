@@ -1404,25 +1404,27 @@ with tab_dupont:
     st.subheader("📊 Multi-Factor Intelligence & DuPont Analytics Hub (Nifty 500 Universe)")
     st.caption("ℹ️ **Integrated Quantitative Screening Engine:** Combines 90-Day ADTV Liquidity Gate (≥₹10 Cr), 3-Stage DuPont Quality (Margin × Turnover × Leverage), 12M-1M Momentum, 60D Realized Volatility Penalty, and Institutional Volume Accumulation ($Z_{accum}$) with Forensic Governance Circuit Breakers.")
     st.info(
-        "💡 **Fundamentals Architecture:** Audited balance sheets, income statements, and cash-flow filings are ingested via "
-        "a structured REST payload (EODHD) with zero brittle HTML web scraping, computing real DuPont 3-Stage decomposition "
-        "and 9-point Piotroski F-Scores. **Without an API key below, no audited data exists to sync** -- the Piotroski "
-        "safety gate then blocks every ticker from fresh capital allocation rather than trade on estimated numbers."
+        "💡 **Fundamentals Architecture:** Audited balance sheets, income statements, and cash-flow filings are ingested "
+        "from Yahoo Finance by default -- free, no key required -- computing real DuPont 3-Stage decomposition and a "
+        "genuine 9-point Piotroski F-Score from real year-over-year filing data. An optional EODHD key below is tried "
+        "first if provided (an alternate paid provider; its free tier does not include this data). If neither can "
+        "return real data for a ticker, it's persisted as a clearly-labeled estimate and the Piotroski safety gate "
+        "blocks it from fresh capital allocation rather than trade on unverified numbers."
     )
 
     # -------------------------------------------------------------------------
     # 0. AUDITED STRUCTURED REST INGESTION SYNC
     # -------------------------------------------------------------------------
     structured_api_key = st.text_input(
-        "EODHD API Key (required for real audited data):", type="password",
+        "EODHD API Key (optional -- Yahoo Finance is used automatically without one):", type="password",
         key="structured_fundamentals_api_key",
-        help="Without a key, syncing only persists clearly-labeled estimates that the Piotroski F-Score gate will not trade on."
+        help="Yahoo Finance (free, no key) is tried whenever this is blank or EODHD has no data for a ticker."
     )
     if structured_api_key:
         st.caption(
             "🧪 First sync with a new key: spot-check one ticker's numbers against its actual "
             "filings before relying on this broadly -- the EODHD response field mapping has not "
-            "been verified against a live API response."
+            "been verified against a live API response (unlike the Yahoo Finance path, which was)."
         )
     _last_synced = get_fundamentals_last_synced()
     sync_col1, sync_col2 = st.columns([1, 2])
@@ -1459,18 +1461,26 @@ with tab_dupont:
 
         if not synced_df.empty:
             audited_count = int(synced_df['Data Source'].astype(str).str.contains('Audited|Not Applicable', regex=True).sum()) if 'Data Source' in synced_df.columns else 0
-            if structured_api_key:
-                msg = f"✅ Successfully ingested and persisted audited fundamentals for {audited_count}/{len(synced_df)} tickers to data/fundamentals.parquet."
-                if audited_count < len(synced_df):
-                    msg += f" {len(synced_df) - audited_count} ticker(s) failed the EODHD lookup and were persisted as unaudited estimates -- they remain blocked by the F-Score gate until re-synced."
+            total = len(synced_df)
+            if audited_count == total:
+                msg = f"✅ Successfully ingested and persisted real audited fundamentals for all {total} tickers to data/fundamentals.parquet (Yahoo Finance and/or EODHD)."
+                audited_ok = True
+            elif audited_count > 0:
+                msg = (
+                    f"⚠️ Ingested real audited fundamentals for {audited_count}/{total} tickers. "
+                    f"{total - audited_count} ticker(s) had no usable data from any provider and were persisted as "
+                    "clearly-labeled estimates -- they remain blocked by the Piotroski F-Score gate until re-synced."
+                )
+                audited_ok = False
             else:
                 msg = (
-                    f"⚠️ No API key provided -- persisted {len(synced_df)} tickers as clearly-labeled estimates, "
-                    "not audited data. Every one of them remains blocked by the Piotroski F-Score safety gate. "
-                    "Enter your EODHD API key above and sync again to unlock real audited scoring."
+                    f"⚠️ No real audited data could be fetched for any of the {total} tickers -- Yahoo Finance had no "
+                    "usable statements for them" + (" and the EODHD key didn't return data either" if structured_api_key else "") +
+                    ". Persisted as clearly-labeled estimates; every one remains blocked by the Piotroski F-Score safety gate."
                 )
+                audited_ok = False
             st.session_state['last_structured_sync_summary'] = {
-                'audited': bool(structured_api_key),
+                'audited': audited_ok,
                 'message': msg
             }
         st.cache_data.clear()
