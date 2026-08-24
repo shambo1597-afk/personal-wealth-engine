@@ -1011,17 +1011,16 @@ tab_ticket, tab_visuals, tab_dupont, tab_harvest, tab_db = st.tabs([
 with tab_ticket:
     st.subheader("📋 Actionable Demat Trade Ticket (Quantamental Wealth Engine v12.0)")
     if years_to_goal <= 3.0:
-        st.warning("🛡️ **Endpoint LDI Shield Active (T ≤ 3Y):** 3-Year cash needs are locked into Sovereign Debt (GILT5YBEES). Portfolio is 100% insulated from sudden market crashes / pandemics on your target encashment date.")
-    if total_available_broker_cash > 0:
-        st.info("💡 **Tax-Free Cash Rebalancing Active:** Fresh cash is automatically routed to underweight assets to restore optimal tangency with zero sell friction.")
-    st.info("💡 **Instructions for Zerodha / Groww:** Place Delivery (CNC) Market Orders for the 🟢 BUY signals below, then click '💾 Commit Trades to SQLite Database' in the sidebar to lock your ledger.")
-    st.warning(
-        "⚠️ **Before you place any order:** the Piotroski F-Score gate runs on audited financials "
-        "ingested via structured REST pipelines (see the 'Multi-Factor Quality & Momentum Scorecard' tab → **🔄 Sync "
-        "Audited Structured Financials** and the **Fundamentals Source** column). A ⛔ **FUNDAMENTALS NOT SYNCED** "
-        "action means this ticker has no verified data at all and is blocked until you sync."
-    )
-    
+        st.info("🛡️ **Endpoint LDI Shield Active (T ≤ 3Y):** 3-Year cash needs are locked into Sovereign Debt (GILT5YBEES). Portfolio is 100% insulated from sudden market crashes / pandemics on your target encashment date.")
+    with st.expander("ℹ️ How to execute these orders", expanded=False):
+        st.caption("Place Delivery (CNC) Market Orders for the 🟢 BUY signals below, then click '💾 Commit Trades to SQLite Database' in the sidebar to lock your ledger. Fresh broker cash is routed automatically to underweight assets with zero sell friction.")
+    if complete_order_tbl['Action'].astype(str).str.contains('⛔').any():
+        st.warning(
+            "⚠️ **Some tickers below are BUY-blocked.** The Piotroski F-Score gate only clears audited financials "
+            "(see the 'Multi-Factor Quality & Momentum Scorecard' tab → **🔄 Sync Audited Structured Financials** and "
+            "the **Fundamentals Source** column) -- a ⛔ **FUNDAMENTALS NOT SYNCED** action means no verified data exists yet."
+        )
+
     with st.expander("⚡ 1-Click Zerodha Kite Basket Order Exporter", expanded=False):
         basket_mode = st.radio(
             "Basket Export Mode:",
@@ -1761,29 +1760,14 @@ with tab_dupont:
                 )
                 st.caption("*(Volume Accumulation)*")
 
-            # Contextual diagnosis
-            if accum_ratio_val >= 2.0:
-                st.success(f"🔥 **Heavy Institutional Accumulation ({accum_ratio_val:.2f}x Volume):** {selected_asset} is experiencing aggressive institutional capital inflows driven by structural catalysts.")
-            elif accum_ratio_val >= 1.3:
-                st.info(f"🟢 **Steady Institutional Inflows ({accum_ratio_val:.2f}x Volume):** {selected_asset} exhibits consistent buying demand above its 90-day baseline.")
-
+            # Only the F-Score status gets a colored banner -- it's the one metric above
+            # that actually gates capital allocation. Institutional accumulation, leverage,
+            # margin, and turnover are already shown as numbers with badges in the metric
+            # cards above; restating each in its own colored box added weight, not information.
             if f_score_val is None:
-                st.warning(f"⚪ **Piotroski F-Score Unavailable:** {f_badge_val}. Fresh capital allocation is blocked for {selected_asset} until real audited data is available (sync, or this is a Financial Institution the score doesn't apply to).")
-            elif f_score_val >= 8:
-                st.success(f"🟢 **Piotroski F-Score ({f_score_val}/9 — Strong):** {selected_asset} exhibits pristine financial strength across profitability, positive cash flows (CFO > Net Income), improving asset efficiency, and zero share dilution.")
+                st.warning(f"⚪ **Fresh capital allocation blocked:** {f_badge_val}. Real audited data isn't available yet for {selected_asset} (sync it, or this is a Financial Institution the score doesn't apply to).")
             elif f_score_val <= 3:
-                st.error(f"⛔ **Piotroski F-Score ({f_score_val}/9 — Decaying / Distressed):** {selected_asset} shows deteriorating balance sheet quality, weak accruals, or elevated leverage. Fresh capital allocation blocked by Quality Gate.")
-            elif f_score_val <= 4:
-                st.warning(f"⚠️ **Piotroski F-Score ({f_score_val}/9 — Low Quality):** {selected_asset} demonstrates sub-optimal earnings accruals or compressed operating margins.")
-            else:
-                st.info(f"🔵 **Piotroski F-Score ({f_score_val}/9 — Moderate Stability):** {selected_asset} maintains stable financial operations with sound solvency.")
-
-            if leverage_val is not None and leverage_val > 3.0:
-                st.warning(f"⚠️ **High Financial Leverage ({leverage_val:.2f}x):** {selected_asset}'s ROE is heavily boosted by debt rather than high operating profit margins.")
-            elif npm_val is not None and npm_val > 20.0:
-                st.info(f"💎 **Strong Pricing Power ({npm_val:.1f}% Margin):** {selected_asset} demonstrates a competitive moat with high net profitability.")
-            elif turnover_val is not None and turnover_val > 1.2:
-                st.info(f"⚡ **High Asset Velocity ({turnover_val:.2f}x Turnover):** {selected_asset} operates with lean, highly productive asset turnover.")
+                st.error(f"⛔ **Fresh capital allocation blocked:** Piotroski {f_score_val}/9 -- deteriorating balance sheet quality, weak accruals, or elevated leverage.")
 
     st.markdown("---")
 
@@ -1943,7 +1927,7 @@ with tab_harvest:
     st.markdown("#### 1. 💎 Qualified Section 112A LTCG Profits (Holding Period ≥ 365 Days)")
     if unrealized_tax_analysis['harvest_rows']:
         st.dataframe(pd.DataFrame(unrealized_tax_analysis['harvest_rows']), width="stretch")
-        st.success(f"• **Total Available LTCG Profit:** ₹{unrealized_tax_analysis['total_harvestable_profit']:,.2f} / ₹1,25,000 Annual Tax-Free Quota")
+        st.caption(f"**Total Available LTCG Profit:** ₹{unrealized_tax_analysis['total_harvestable_profit']:,.2f} / ₹1,25,000 Annual Tax-Free Quota")
     else:
         st.info("✓ Zero unrealized LTCG profits qualifying for tax-free Section 112A harvest today.")
 
@@ -1953,7 +1937,7 @@ with tab_harvest:
     st.markdown("#### 2. 📉 Tax-Loss Harvesting Inspector (Offsetting STCG / LTCG Liabilities)")
     if unrealized_tax_analysis['loss_rows']:
         st.dataframe(pd.DataFrame(unrealized_tax_analysis['loss_rows']), width="stretch")
-        st.warning(f"• **Total Harvestable Capital Losses:** ₹{unrealized_tax_analysis['total_harvestable_losses']:,.2f} available to neutralize capital gains tax.")
+        st.caption(f"**Total Harvestable Capital Losses:** ₹{unrealized_tax_analysis['total_harvestable_losses']:,.2f} available to neutralize capital gains tax.")
     else:
         st.info("✓ Zero positions with unrealized losses in your portfolio.")
 
