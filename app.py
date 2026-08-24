@@ -1418,6 +1418,12 @@ with tab_dupont:
         key="structured_fundamentals_api_key",
         help="Without a key, syncing only persists clearly-labeled estimates that the Piotroski F-Score gate will not trade on."
     )
+    if structured_api_key:
+        st.caption(
+            "🧪 First sync with a new key: spot-check one ticker's numbers against its actual "
+            "filings before relying on this broadly -- the EODHD response field mapping has not "
+            "been verified against a live API response."
+        )
     _last_synced = get_fundamentals_last_synced()
     sync_col1, sync_col2 = st.columns([1, 2])
     with sync_col1:

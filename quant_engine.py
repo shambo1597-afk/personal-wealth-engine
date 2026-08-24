@@ -1087,7 +1087,12 @@ def fetch_structured_company_fundamentals(ticker: str, api_key: Optional[str] = 
     Fetches audited financial statement JSON payloads (Balance Sheet, Income Statement, Cash Flow)
     via a structured REST API. Only provider='EODHD' is implemented; any other value falls through
     to the unaudited local estimate (see _fetch_single_fundamental) exactly as if no api_key were given.
-    Computes real DuPont ROE, Margin, Debt/Equity, and 9-Point Piotroski F-Score.
+    Computes real DuPont ROE, Margin, Debt/Equity, and a 9-Point Piotroski F-Score -- every
+    criterion is a real audited-filing check or a real year-over-year comparison, never a
+    hardcoded pass; with only one year of filings, the two YoY criteria fail closed.
+    Caveat: the EODHD field names below (netIncome, totalStockholderEquity, PERatio, etc.) have
+    not been verified against a live response -- this environment has no network access to
+    eodhd.com and no test API key. Smoke-test against one real ticker before trusting this broadly.
     """
     clean_sym = ticker.replace('.NS', '').strip()
     
@@ -1099,13 +1104,17 @@ def fetch_structured_company_fundamentals(ticker: str, api_key: Optional[str] = 
                 resp = requests.get(url, timeout=4.0)
                 if resp.status_code == 200:
                     data = resp.json()
-                    financials = data.get('Financials', {})
-                    bs = financials.get('Balance_Sheet', {}).get('yearly', {})
-                    inc = financials.get('Income_Statement', {}).get('yearly', {})
-                    cf = financials.get('Cash_Flow', {}).get('yearly', {})
-                    
-                    # Extract latest annual audited values
-                    latest_yr = sorted(inc.keys())[-1] if inc else None
+                    financials = data.get('Financials') or {}
+                    bs = (financials.get('Balance_Sheet') or {}).get('yearly') or {}
+                    inc = (financials.get('Income_Statement') or {}).get('yearly') or {}
+                    cf = (financials.get('Cash_Flow') or {}).get('yearly') or {}
+
+                    # Extract latest two annual audited periods -- Piotroski's test is mostly
+                    # year-over-year deltas (ROA trend, turnover trend, etc.), not just this
+                    # year's absolute level, so a single year of data cannot compute it.
+                    sorted_years = sorted(inc.keys()) if inc else []
+                    latest_yr = sorted_years[-1] if sorted_years else None
+                    prior_yr = sorted_years[-2] if len(sorted_years) >= 2 else None
                     if latest_yr:
                         net_inc = float(inc[latest_yr].get('netIncome', 0.0) or 0.0)
                         rev = float(inc[latest_yr].get('totalRevenue', 0.0) or 0.0)
@@ -1113,22 +1122,50 @@ def fetch_structured_company_fundamentals(ticker: str, api_key: Optional[str] = 
                         equity = float(bs.get(latest_yr, {}).get('totalStockholderEquity', 0.0) or 0.0) if bs else 0.0
                         debt = float(bs.get(latest_yr, {}).get('shortLongTermDebtTotal', 0.0) or 0.0) if bs else 0.0
                         cfo = float(cf.get(latest_yr, {}).get('totalCashFromOperatingActivities', 0.0) or 0.0) if cf else 0.0
-                        
+
                         npm = (net_inc / rev * 100.0) if rev > 0 else 12.0
                         turnover = (rev / assets) if assets > 0 else 0.85
                         leverage = (assets / equity) if equity > 0 else 1.80
                         roe = npm * turnover * leverage
                         de = (debt / equity) if equity > 0 else 0.35
-                        
-                        # Accurate 9-point Piotroski F-score from audited filings
+                        roa = (net_inc / assets) if assets > 0 else 0.0
+
+                        # Genuine year-over-year criteria (real Piotroski, not level thresholds).
+                        # If there's no prior year to compare against, these fail closed (no free
+                        # point for "we don't know") rather than being assumed true.
+                        roa_improved = False
+                        turnover_improved = False
+                        if prior_yr:
+                            net_inc_prev = float(inc[prior_yr].get('netIncome', 0.0) or 0.0)
+                            rev_prev = float(inc[prior_yr].get('totalRevenue', 0.0) or 0.0)
+                            assets_prev = float(bs.get(prior_yr, {}).get('totalAssets', 0.0) or 0.0) if bs else 0.0
+                            if assets_prev > 0:
+                                roa_improved = roa > (net_inc_prev / assets_prev)
+                                turnover_improved = turnover > (rev_prev / assets_prev)
+
+                        # Genuine 9-point Piotroski F-score. Every criterion is either a real
+                        # audited-filing check or a real year-over-year comparison -- never a
+                        # hardcoded pass, so a ticker with only one year of filings scores lower
+                        # rather than getting free credit for criteria that couldn't be checked.
                         f_score = int(sum([
                             net_inc > 0, cfo > 0, roe >= 12.0, cfo > net_inc,
-                            de <= 0.80, True, True, npm >= 10.0, turnover >= 0.70
+                            de <= 0.80, roa_improved, turnover_improved, npm >= 10.0, turnover >= 0.70
                         ]))
-                        
+
                         f_badge = "🟢 Strong (8-9/9)" if f_score >= 8 else ("🔵 Moderate (5-7/9)" if f_score >= 5 else "🔴 Weak / Decay (≤4/9)")
                         f_display = f"{f_score}/9 ★" if f_score >= 8 else f"{f_score}/9"
                         now_utc = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+
+                        # EODHD's fundamentals payload carries valuation multiples in a separate
+                        # 'Highlights' section, not under 'Financials' -- try it, but this hasn't
+                        # been verified against a live response (no test API key / no network
+                        # access to eodhd.com in this environment), so fall back to the same
+                        # placeholder as before rather than silently trusting an unverified field.
+                        pe_val = (data.get('Highlights') or {}).get('PERatio')
+                        try:
+                            pe_val = float(pe_val) if pe_val not in (None, '', 'None') else 26.0
+                        except (TypeError, ValueError):
+                            pe_val = 26.0
 
                         # Piotroski's 9-point test assumes an industrial/retail balance sheet
                         # (inventory turnover, current ratio, etc.) and doesn't cleanly apply to
@@ -1143,14 +1180,15 @@ def fetch_structured_company_fundamentals(ticker: str, api_key: Optional[str] = 
                             'sync_error': None, 'last_synced_utc': now_utc,
                             'DuPont ROE (%)': f"{roe:.1f}%", 'Net Profit Margin (%)': f"{npm:.1f}%",
                             'Asset Turnover (x)': f"{turnover:.2f}x", 'Financial Leverage (x)': f"{leverage:.2f}x",
-                            'Debt / Equity': f"{de:.2f}x", 'P/E Ratio': '26.0x',
+                            'Debt / Equity': f"{de:.2f}x", 'P/E Ratio': f"{pe_val:.1f}x",
                             'Fundamental Health': '✅ High Quality (Audited)' if de < 0.7 else '🔵 Moderate Stability',
                             'Piotroski F-Score': f_display, 'piotroski_f_score': f_score,
                             'piotroski_badge': f_badge, 'f_score_num': f_score,
                             'f_score_label': f_badge, 'f_score_display': f_display,
                             'roe_num': roe, 'de_num': de, 'npm_num': npm,
-                            'turnover_num': turnover, 'leverage_num': leverage, 'pe_num': 26.0,
-                            'piotroski_criteria_available': 9, 'piotroski_note': None
+                            'turnover_num': turnover, 'leverage_num': leverage, 'pe_num': pe_val,
+                            'piotroski_criteria_available': 9 if prior_yr else 7,
+                            'piotroski_note': None if prior_yr else 'ΔROA/ΔTurnover default to failing -- only one year of filings was available.'
                         }
         except Exception:
             pass
