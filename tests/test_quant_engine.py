@@ -356,35 +356,31 @@ class TestStructuredFundamentals:
         assert res['roe_num'] > 0
         assert res['pe_num'] > 0
 
-    def test_eodhd_rest_api_payload_parsing(self, monkeypatch):
-        mock_eodhd_json = {
+    def _mock_eodhd_json(self, include_prior_year=True):
+        periods = {
+            '2024-03-31': {'assets': '1000000', 'equity': '600000', 'debt': '50000', 'rev': '1200000', 'ni': '180000', 'cfo': '200000'},
+        }
+        if include_prior_year:
+            # Weaker prior year: both ROA and asset turnover genuinely improved YoY.
+            periods['2023-03-31'] = {'assets': '900000', 'equity': '550000', 'debt': '60000', 'rev': '1000000', 'ni': '100000', 'cfo': '95000'}
+
+        return {
             'Financials': {
-                'Balance_Sheet': {
-                    'yearly': {
-                        '2024-03-31': {
-                            'totalAssets': '1000000',
-                            'totalStockholderEquity': '600000',
-                            'shortLongTermDebtTotal': '50000',
-                        }
-                    }
-                },
-                'Income_Statement': {
-                    'yearly': {
-                        '2024-03-31': {
-                            'totalRevenue': '1200000',
-                            'netIncome': '180000',
-                        }
-                    }
-                },
-                'Cash_Flow': {
-                    'yearly': {
-                        '2024-03-31': {
-                            'totalCashFromOperatingActivities': '200000',
-                        }
-                    }
-                }
+                'Balance_Sheet': {'yearly': {
+                    yr: {'totalAssets': p['assets'], 'totalStockholderEquity': p['equity'], 'shortLongTermDebtTotal': p['debt']}
+                    for yr, p in periods.items()
+                }},
+                'Income_Statement': {'yearly': {
+                    yr: {'totalRevenue': p['rev'], 'netIncome': p['ni']} for yr, p in periods.items()
+                }},
+                'Cash_Flow': {'yearly': {
+                    yr: {'totalCashFromOperatingActivities': p['cfo']} for yr, p in periods.items()
+                }},
             }
         }
+
+    def test_eodhd_rest_api_payload_parsing(self, monkeypatch):
+        mock_eodhd_json = self._mock_eodhd_json(include_prior_year=True)
 
         class MockResponse:
             status_code = 200
@@ -399,7 +395,31 @@ class TestStructuredFundamentals:
         assert res['npm_num'] == pytest.approx(15.0)  # 180k / 1200k = 15%
         assert res['turnover_num'] == pytest.approx(1.2)  # 1200k / 1000k = 1.2
         assert res['leverage_num'] == pytest.approx(1000000 / 600000)
-        assert res['piotroski_f_score'] >= 8
+        # Both YoY criteria (ROA improved, turnover improved) are genuinely earned here --
+        # 180k/1M=18% ROA vs 100k/900k=11.1% prior, and 1.2x turnover vs 1.11x prior.
+        assert res['piotroski_f_score'] == 9
+        assert res['piotroski_criteria_available'] == 9
+
+    def test_eodhd_single_year_of_filings_fails_closed_not_free_points(self, monkeypatch):
+        # Regression test for a real bug: the Piotroski YoY criteria used to be hardcoded `True`
+        # regardless of data, silently inflating every audited company's score by 2 points. With
+        # only one year of filings on hand, those two criteria must now fail (not pass by default).
+        mock_eodhd_json = self._mock_eodhd_json(include_prior_year=False)
+
+        class MockResponse:
+            status_code = 200
+            def json(self):
+                return mock_eodhd_json
+
+        import requests
+        monkeypatch.setattr(requests, 'get', lambda url, timeout=4.0: MockResponse())
+
+        res = fetch_structured_company_fundamentals('INFY.NS', api_key='TEST_KEY', provider='EODHD')
+        # Same latest-year fundamentals as the full test above, so every criterion that doesn't
+        # need a prior year still passes -- only the 2 YoY criteria are unavailable. 9 - 2 = 7.
+        assert res['piotroski_f_score'] == 7
+        assert res['piotroski_criteria_available'] == 7
+        assert res['piotroski_note'] is not None
 
 
 class TestZerodhaKiteIntegration:
