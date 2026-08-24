@@ -38,7 +38,7 @@ from quant_engine import (
     fetch_structured_company_fundamentals, get_fundamentals_last_synced,
     get_kite_client, sync_zerodha_live_data,
     fetch_live_dynamic_multiasset_universe,
-    SECTOR_MAP, get_asset_sector, get_asset_class
+    get_asset_sector, get_asset_class
 )
 from tax_engine import (
     compute_realized_tax_summary, compute_unrealized_tax_lots_analysis, build_schedule_112a_records,
@@ -108,7 +108,11 @@ with st.sidebar.expander("🔐 Zerodha Kite Connect Sync (Optional)", expanded=F
         if kite_client:
             st.success("🟢 Zerodha Kite Connected (Live Holdings & Cash Synced)")
             try:
-                kite_holdings, kite_margins, kite_quotes = sync_zerodha_live_data(kite_client, list(SECTOR_MAP.keys()))
+                # Only holdings + margin are needed here -- the quotes this returns are never
+                # read (the dashboard re-fetches quotes later for the actual selected universe),
+                # so pass no tickers rather than burn a needless ~170-symbol Kite LTP call on
+                # every single Streamlit rerun.
+                kite_holdings, kite_margins, kite_quotes = sync_zerodha_live_data(kite_client, [])
                 if kite_holdings:
                     st.caption(f"💼 Synced **{len(kite_holdings)}** Demat holdings | Available Margin: **₹{kite_margins:,.2f}**")
                     st.caption(

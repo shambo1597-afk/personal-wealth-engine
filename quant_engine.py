@@ -38,7 +38,6 @@ from config import (
 
 # Direct NSE India Bhavcopy & Official Market Calendar Integrations
 try:
-    import nselib
     from nselib import capital_market as nse_cm
     NSELIB_AVAILABLE = True
 except Exception:
@@ -224,38 +223,6 @@ def get_asset_sector(ticker: str, sector_map: Optional[Dict[str, str]] = None) -
         return 'Sovereign Fixed Income (Sec 50AA)'
     
     return s_clean
-
-def fetch_nse_corporate_actions(symbol: Optional[str] = None) -> pd.DataFrame:
-    """
-    Fetches official NSE corporate actions (splits, bonuses, dividends) directly from NSE India via nselib.
-    """
-    if NSELIB_AVAILABLE and nse_cm is not None:
-        try:
-            if symbol:
-                clean_sym = symbol.replace('.NS', '').strip()
-                return nse_cm.corporate_actions_for_equity(clean_sym)
-            return nse_cm.corporate_actions_for_equity()
-        except Exception:
-            return pd.DataFrame()
-    return pd.DataFrame()
-
-def fetch_nse_bhavcopy_daily(trade_date: Optional[str] = None) -> pd.DataFrame:
-    """
-    Fetches official daily NSE Bhavcopy EOD prices and delivery volumes directly from NSE India.
-    trade_date: 'dd-mm-yyyy' string or None for latest available.
-    """
-    if NSELIB_AVAILABLE and nse_cm is not None:
-        try:
-            if trade_date:
-                df = nse_cm.bhav_copy_equities(trade_date)
-            else:
-                df = nse_cm.bhav_copy_equities()
-            if df is not None and not df.empty and 'SYMBOL' in df.columns:
-                df['Ticker'] = df['SYMBOL'].str.strip() + '.NS'
-                return df
-        except Exception:
-            pass
-    return pd.DataFrame()
 
 def get_asset_class(ticker: str, class_map: Optional[Dict[str, str]] = None) -> str:
     """
@@ -1118,7 +1085,8 @@ def _fetch_single_fundamental(ticker: str) -> Dict[str, Any]:
 def fetch_structured_company_fundamentals(ticker: str, api_key: Optional[str] = None, provider: str = 'EODHD') -> Dict[str, Any]:
     """
     Fetches audited financial statement JSON payloads (Balance Sheet, Income Statement, Cash Flow)
-    via structured REST API (EODHD / FMP / clean JSON endpoint).
+    via a structured REST API. Only provider='EODHD' is implemented; any other value falls through
+    to the unaudited local estimate (see _fetch_single_fundamental) exactly as if no api_key were given.
     Computes real DuPont ROE, Margin, Debt/Equity, and 9-Point Piotroski F-Score.
     """
     clean_sym = ticker.replace('.NS', '').strip()
@@ -1211,12 +1179,13 @@ def sync_zerodha_live_data(kite: Any, tickers: List[str]) -> Tuple[List[Dict[str
             holdings = [{'ticker': f"{h['tradingsymbol']}.NS", 'quantity': h['quantity'], 'buy_price': h['average_price']} for h in h_resp if h.get('quantity', 0) > 0]
             m_resp = kite.margins(segment='equity')
             margins = float(m_resp.get('available', {}).get('live_balance', 0.0))
-            q_keys = [f"NSE:{t.replace('.NS', '')}" for t in tickers]
-            quotes = kite.ltp(q_keys)
-            for t in tickers:
-                k = f"NSE:{t.replace('.NS', '')}"
-                if k in quotes:
-                    live_quotes[t] = float(quotes[k]['last_price'])
+            if tickers:
+                q_keys = [f"NSE:{t.replace('.NS', '')}" for t in tickers]
+                quotes = kite.ltp(q_keys)
+                for t in tickers:
+                    k = f"NSE:{t.replace('.NS', '')}"
+                    if k in quotes:
+                        live_quotes[t] = float(quotes[k]['last_price'])
         except Exception:
             pass
     return holdings, margins, live_quotes
@@ -1376,8 +1345,7 @@ def compute_multifactor_rankings(
         return pd.DataFrame()
 
     sub_prices = price_history_df[valid_cols]
-    N_bars = len(sub_prices)
-    
+
     # 1. 90-Day ADTV Liquidity Gate Evaluation
     adtv_map = {}
     if adtv_series is not None:
@@ -2356,15 +2324,6 @@ def fetch_master_market_data(
     live_volumes = raw_volume_aligned.loc[live_assets.index]
     live_bench = bench_series.loc[bench_series.index >= pd.to_datetime(live_train_start_str)]
 
-    # Pre-screen liquid candidate equities in RAM (< 5ms) to fetch news only for candidate set
-    prelim_scorecard = compute_multifactor_rankings(
-        live_assets, tickers_list, universe_fundamentals,
-        volume_history_df=live_volumes,
-        adtv_series=adtv_90d_series, min_adtv=MIN_ADTV_INR, top_n=TOP_N_SELECTED_EQUITIES * 2
-    )
-    liquid_top = prelim_scorecard[prelim_scorecard['Is_Liquid'] == True]['Ticker'].head(25).tolist()
-    candidate_tickers_for_news = liquid_top if liquid_top else tickers_list[:25]
-
     # Pre-compute live multi-factor scorecard with instant in-memory sentiment baseline (< 1ms)
     news_data = {}
     sent_series, gov_flags, triggers = compute_news_sentiment_for_universe(tickers_list, news_data, turbo_mode=turbo_mode)
@@ -2533,7 +2492,7 @@ def ingest_and_run_dual_pipeline(mode: str = 'Max-Sharpe (Ledoit-Wolf)', rf_rate
 # 6. EXACT ANNUALIZED MONEY-WEIGHTED XIRR ENGINE (NEWTON-RAPHSON)
 # ----------------------------------------------------------------------------------------------------
 def compute_portfolio_xirr(cash_flows: List[float], dates: List[Any]) -> Tuple[float, str]:
-    """
+    r"""
     Solves for exact annualized money-weighted rate of return (XIRR) $r$ via Newton-Raphson:
       \sum_{i=1}^n \frac{C_i}{(1 + r)^{(d_i - d_0) / 365.0}} = 0
     Returns (rate_float, formatted_string).
