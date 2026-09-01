@@ -41,7 +41,7 @@ pandas==3.0.5
 pandas_market_calendars==5.4.0
 peewee==4.4.0
 pillow==12.3.0
-platformdirs==4.11.4
+platformdirs==4.11.5
 plotly==6.9.0
 protobuf==7.36.0
 pyarrow==25.0.1
