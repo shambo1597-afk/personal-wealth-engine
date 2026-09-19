@@ -1,6 +1,6 @@
 # ====================================================================================================
 # MASTER QUANTITATIVE WEALTH OPERATING SYSTEM (STREAMLIT PRODUCTION SUITE v12.0)
-# Modular Architecture: config | database | quant_engine | tax_engine | app (Orchestration)
+# Modular Architecture: config | database | quant_engine | tax_engine | goals_engine | app (Orchestration)
 # ====================================================================================================
 
 import os
@@ -38,11 +38,20 @@ from quant_engine import (
     fetch_structured_company_fundamentals, get_fundamentals_last_synced,
     get_kite_client, sync_zerodha_live_data,
     fetch_live_dynamic_multiasset_universe,
-    get_asset_sector, get_asset_class
+    get_asset_sector, get_asset_class,
+    compute_sortino_ratio, compute_max_drawdown, compute_calmar_ratio, compute_treynor_ratio,
+    compute_historical_var, compute_parametric_var, compute_cvar, MIN_OBSERVATIONS_FOR_RISK_METRICS,
+    compute_monte_carlo_wealth_projection,
+    run_portfolio_stress_test, STRESS_TEST_SCENARIOS,
 )
 from tax_engine import (
     compute_realized_tax_summary, compute_unrealized_tax_lots_analysis, build_schedule_112a_records,
     recommend_tax_loss_harvesting_trades
+)
+from goals_engine import (
+    GOAL_TYPES, GOAL_TYPE_EMERGENCY_FUND, DEFAULT_EMERGENCY_FUND_MONTHS, DEFAULT_ON_TRACK_TOLERANCE,
+    compute_goal_future_value, compute_required_monthly_sip, compute_goal_progress,
+    compute_emergency_fund_target,
 )
 
 warnings.filterwarnings('ignore')
@@ -1019,11 +1028,12 @@ if final_execute:
 # ----------------------------------------------------------------------------------------------------
 # 7. TABS INTERFACE: DEMAT TICKET, VISUAL SUITE, MULTI-FACTOR SCORECARD, TAX HARVESTING & LEDGER
 # ----------------------------------------------------------------------------------------------------
-tab_ticket, tab_visuals, tab_dupont, tab_harvest, tab_db = st.tabs([
+tab_ticket, tab_visuals, tab_dupont, tab_harvest, tab_risk_lab, tab_db = st.tabs([
     "📋 Actionable Demat Ticket",
     "📈 Quantitative Visual Suite",
     "📊 Multi-Factor Quality & Momentum Scorecard",
     "💎 Section 112A Tax Harvester",
+    "🎯 Risk & Planning Lab",
     "📂 SQLite Audit & Tax Ledger"
 ])
 
@@ -1974,7 +1984,214 @@ with tab_harvest:
     else:
         st.info("✓ Zero positions with unrealized losses in your portfolio.")
 
-# --- TAB 5: SQLITE AUDIT & TAX LEDGER ---
+# --- TAB 5: RISK & PLANNING LAB ---
+with tab_risk_lab:
+    st.subheader("🎯 Risk & Planning Lab")
+
+    def _fmt_ratio(x):
+        if x is None:
+            return "N/A"
+        if np.isinf(x):
+            return "∞"
+        return f"{x:.2f}"
+
+    def _fmt_pct(x):
+        if x is None:
+            return "N/A"
+        return f"{x*100:.2f}%"
+
+    # --- 1. RISK-ADJUSTED RETURN METRICS ---
+    st.markdown("#### 📐 Risk-Adjusted Return Metrics (Current Optimized Portfolio)")
+    if OPTIMAL_K > 0 and not active_returns_df.empty:
+        portfolio_returns_series = pd.Series(active_returns_df.values @ w_optimal_live, index=active_returns_df.index)
+    else:
+        portfolio_returns_series = pd.Series(dtype=float)
+
+    sortino_val = compute_sortino_ratio(portfolio_returns_series, risk_free_rate=RISK_FREE_RATE)
+    calmar_val = compute_calmar_ratio(portfolio_returns_series)
+    treynor_val = compute_treynor_ratio(portfolio_returns_series, bench_returns, risk_free_rate=RISK_FREE_RATE)
+    hist_var_val = compute_historical_var(portfolio_returns_series, confidence=0.95)
+    param_var_val = compute_parametric_var(portfolio_returns_series, confidence=0.95)
+    cvar_val = compute_cvar(portfolio_returns_series, confidence=0.95)
+    mdd_result = compute_max_drawdown(portfolio_returns_series, input_type='returns')
+    mdd_val = mdd_result[0] if mdd_result is not None else None
+
+    if sortino_val is None:
+        st.caption(f"⚠️ Fewer than {MIN_OBSERVATIONS_FOR_RISK_METRICS} return observations available -- metrics below show N/A until more price history accumulates.")
+
+    rm_col1, rm_col2, rm_col3, rm_col4 = st.columns(4)
+    with rm_col1:
+        st.metric("Sortino Ratio", _fmt_ratio(sortino_val))
+    with rm_col2:
+        st.metric("Calmar Ratio", _fmt_ratio(calmar_val))
+    with rm_col3:
+        st.metric("Treynor Ratio", _fmt_ratio(treynor_val))
+    with rm_col4:
+        st.metric("Max Drawdown", _fmt_pct(mdd_val))
+
+    rm_col5, rm_col6, rm_col7 = st.columns(3)
+    with rm_col5:
+        st.metric("Historical VaR (95%, 1-Day)", _fmt_pct(hist_var_val))
+    with rm_col6:
+        st.metric("Parametric VaR (95%, 1-Day)", _fmt_pct(param_var_val))
+    with rm_col7:
+        st.metric("CVaR / Expected Shortfall (95%)", _fmt_pct(cvar_val))
+
+    st.markdown("---")
+
+    # --- 2. MONTE CARLO WEALTH PROJECTION ---
+    st.markdown("#### 🔮 Monte Carlo Wealth Projection")
+    mc_col1, mc_col2 = st.columns([2, 1])
+    with mc_col1:
+        mc_years = st.slider("Projection Horizon (Years)", min_value=1, max_value=30, value=20, key="mc_years_slider")
+    with mc_col2:
+        mc_contribution = st.number_input("Additional Annual Contribution (₹)", min_value=0.0, value=0.0, step=10000.0, key="mc_contribution_input")
+
+    port_ann_return = float(np.dot(w_optimal_live, active_mean_vector)) if OPTIMAL_K > 0 else RISK_FREE_RATE
+    port_ann_vol = (
+        float(np.sqrt(max(np.dot(w_optimal_live.T, np.dot(active_cov_matrix, w_optimal_live)), 0.0)))
+        if OPTIMAL_K > 0 else 0.15
+    )
+
+    mc_df = compute_monte_carlo_wealth_projection(
+        current_value_inr=total_portfolio_wealth,
+        expected_annual_return=port_ann_return,
+        annual_volatility=port_ann_vol,
+        years=mc_years,
+        n_simulations=8000,
+        annual_contribution_inr=mc_contribution,
+    )
+
+    fig_mc = go.Figure()
+    fig_mc.add_trace(go.Scatter(
+        x=list(mc_df.index), y=mc_df['p95'], mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'
+    ))
+    fig_mc.add_trace(go.Scatter(
+        x=list(mc_df.index), y=mc_df['p5'], mode='lines', line=dict(width=0),
+        fill='tonexty', fillcolor='rgba(0,191,255,0.2)', name='5th-95th Percentile Range'
+    ))
+    fig_mc.add_trace(go.Scatter(
+        x=list(mc_df.index), y=mc_df['p50'], mode='lines', line=dict(color='deepskyblue', width=3), name='Median (P50) Projection'
+    ))
+    fig_mc.update_layout(
+        title=dict(text=f'Projected Wealth Over {mc_years} Years (Current: ₹{total_portfolio_wealth:,.0f})', x=0.5),
+        xaxis_title='Years from Today',
+        yaxis_title='Projected Portfolio Value (₹)',
+        height=450,
+        margin=dict(l=20, r=20, t=50, b=20),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5)
+    )
+    st.plotly_chart(fig_mc, width="stretch")
+    st.caption(
+        f"Median terminal wealth in {mc_years} years: ₹{mc_df['p50'].iloc[-1]:,.0f} "
+        f"(5th-95th percentile range: ₹{mc_df['p5'].iloc[-1]:,.0f} - ₹{mc_df['p95'].iloc[-1]:,.0f}). "
+        f"Assumes {port_ann_return*100:.1f}% expected annual return / {port_ann_vol*100:.1f}% annual volatility, "
+        "matching your current optimized portfolio. Simple lognormal compounding, not a substitute for professional financial advice."
+    )
+
+    st.markdown("---")
+
+    # --- 3. GOAL-BASED PLANNING ---
+    st.markdown("#### 🎯 Goal-Based Planning")
+    goal_type = st.selectbox("Goal Type", options=GOAL_TYPES, key="goal_type_select")
+
+    if goal_type == GOAL_TYPE_EMERGENCY_FUND:
+        ef_col1, ef_col2, ef_col3 = st.columns(3)
+        with ef_col1:
+            monthly_expenses = st.number_input("Monthly Expenses (₹)", min_value=0.0, value=50000.0, step=1000.0, key="ef_monthly_expenses")
+        with ef_col2:
+            months_coverage = st.number_input("Months of Coverage", min_value=1.0, value=DEFAULT_EMERGENCY_FUND_MONTHS, step=1.0, key="ef_months_coverage")
+        with ef_col3:
+            current_ef_corpus = st.number_input("Current Emergency Corpus (₹)", min_value=0.0, value=0.0, step=1000.0, key="ef_current_corpus")
+
+        ef_target = compute_emergency_fund_target(monthly_expenses, months_coverage)
+        ef_progress = compute_goal_progress(current_ef_corpus, ef_target)
+
+        ge_col1, ge_col2, ge_col3 = st.columns(3)
+        with ge_col1:
+            st.metric("Target Corpus", f"₹{ef_target:,.0f}")
+        with ge_col2:
+            st.metric("Progress", f"{ef_progress['pct_funded']*100:.1f}%")
+        with ge_col3:
+            st.metric(
+                "Status", "✅ On Track" if ef_progress['on_track'] else "⚠️ Shortfall",
+                f"₹{ef_progress['shortfall']:,.0f} needed" if ef_progress['shortfall'] > 0 else None
+            )
+        st.caption("Emergency Fund sizing is deliberately return/inflation-free -- it's a liquidity buffer, not a growth target.")
+    else:
+        gi_col1, gi_col2, gi_col3 = st.columns(3)
+        with gi_col1:
+            goal_target_today = st.number_input("Target Cost (Today's ₹)", min_value=0.0, value=2500000.0, step=50000.0, key="goal_target_today")
+        with gi_col2:
+            goal_years = st.number_input("Years to Goal", min_value=1.0, value=10.0, step=1.0, key="goal_years_input")
+        with gi_col3:
+            goal_inflation = st.number_input("Assumed Inflation Rate (%)", min_value=0.0, value=6.0, step=0.5, key="goal_inflation_input") / 100.0
+
+        gi2_col1, gi2_col2 = st.columns(2)
+        with gi2_col1:
+            goal_expected_return = st.number_input("Expected Annual Return (%)", min_value=0.0, value=12.0, step=0.5, key="goal_return_input") / 100.0
+        with gi2_col2:
+            goal_current_corpus = st.number_input("Current Corpus Saved Toward This Goal (₹)", min_value=0.0, value=0.0, step=10000.0, key="goal_current_corpus")
+
+        goal_fv = compute_goal_future_value(goal_target_today, goal_years, goal_inflation)
+        goal_sip = compute_required_monthly_sip(max(0.0, goal_fv - goal_current_corpus), goal_years, goal_expected_return)
+        goal_progress_result = compute_goal_progress(goal_current_corpus, goal_fv)
+
+        gr_col1, gr_col2, gr_col3, gr_col4 = st.columns(4)
+        with gr_col1:
+            st.metric(f"Future Value ({goal_years:.0f}Y)", f"₹{goal_fv:,.0f}")
+        with gr_col2:
+            st.metric("Required Monthly SIP", f"₹{goal_sip:,.0f}")
+        with gr_col3:
+            st.metric("Current Progress", f"{goal_progress_result['pct_funded']*100:.1f}%")
+        with gr_col4:
+            st.metric(
+                "Status", "✅ On Track" if goal_progress_result['on_track'] else "⚠️ Shortfall",
+                f"₹{goal_progress_result['shortfall']:,.0f} needed" if goal_progress_result['shortfall'] > 0 else None
+            )
+        st.caption(f"Required SIP assumes the SIP itself is invested for the remaining corpus need (Future Value minus what you've already saved), at your stated expected return, in month-end installments over {goal_years:.0f} years.")
+
+    st.markdown("---")
+
+    # --- 4. PORTFOLIO STRESS TEST ---
+    st.markdown("#### 💥 Portfolio Stress Test")
+    stress_scenario_labels = {
+        'market_crash': '📉 Market Crash (-30% Equity Shock)',
+        'inflation_surge': '🔥 Inflation Surge (-4pp Real Return)',
+        'interest_rate_hike': '📈 Interest Rate Hike (+200bps Debt Duration Shock)',
+    }
+    stress_scenario = st.selectbox(
+        "Scenario",
+        options=STRESS_TEST_SCENARIOS,
+        format_func=lambda s: stress_scenario_labels.get(s, s),
+        key="stress_scenario_select"
+    )
+
+    if OPTIMAL_K > 0:
+        stress_result = run_portfolio_stress_test(target_w_series, active_returns_df, stress_scenario, class_map=live_class_map)
+        sr_col1, sr_col2, sr_col3 = st.columns(3)
+        with sr_col1:
+            st.metric("Baseline Annual Return", f"{stress_result['baseline_annual_return']*100:.2f}%")
+        with sr_col2:
+            st.metric(
+                "Shocked Annual Return", f"{stress_result['shocked_annual_return']*100:.2f}%",
+                f"{stress_result['delta_annual_return']*100:+.2f}pp"
+            )
+        with sr_col3:
+            shocked_wealth = total_portfolio_wealth * (1.0 + stress_result['value_delta_pct'])
+            st.metric(
+                "Shocked Portfolio Value", f"₹{shocked_wealth:,.0f}",
+                f"{stress_result['value_delta_pct']*100:+.2f}%"
+            )
+        st.caption(
+            "Applies a one-time level shock to your current optimized weights -- see "
+            "run_portfolio_stress_test() in quant_engine.py for exactly which holdings each "
+            "scenario shocks and by how much. Not a forecast, a sensitivity check."
+        )
+    else:
+        st.info("No active portfolio positions to stress test yet.")
+
+# --- TAB 6: SQLITE AUDIT & TAX LEDGER ---
 with tab_db:
     st.subheader(f"📂 Stored SQLite Tax Lots & Audit Ledger (`{DB_FILE}`)")
     st.caption("Inspect active tax lots, immutable trade ledger, and export Schedule 112A tax reports for ITR filing.")

@@ -13,9 +13,9 @@ A comprehensive, institutional-grade Personal Wealth Management and Quantitative
 
 ### 2. 🧮 Quantitative Finance & Risk Engine (`quant_engine.py`)
 - **Modern Portfolio Theory (Markowitz)**: Efficient Frontier simulation, Maximum Sharpe Ratio, Minimum Volatility, and Custom Target Return optimizations.
-- **Risk Metrics**: Value-at-Risk (VaR Historical & Parametric), Conditional VaR (CVaR / Expected Shortfall), Maximum Drawdown, Sharpe Ratio, Sortino Ratio, Calmar Ratio, Beta, and Treynor Ratio.
-- **Monte Carlo Simulations**: Probabilistic future wealth projections (1 to 30 years) with confidence intervals (5th, 50th, 95th percentiles).
-- **Asset Correlation & Risk Decomposition**: Dynamic correlation heatmaps, portfolio variance attribution, and diversification index.
+- **Risk Metrics**: Value-at-Risk (VaR Historical & Parametric), Conditional VaR (CVaR / Expected Shortfall), Maximum Drawdown, Sharpe Ratio, Sortino Ratio, Calmar Ratio, and Treynor Ratio (Beta is computed internally as part of Treynor via Cov(portfolio, benchmark) / Var(benchmark), not surfaced as a standalone metric). All live in the **🎯 Risk & Planning Lab** tab, computed on your current optimized portfolio's actual daily return series -- each returns `None` rather than a misleading number if fewer than 20 observations are available.
+- **Monte Carlo Simulations**: Probabilistic future wealth projections (1 to 30 years) via lognormal-compounded annual returns, with a 5th/50th/95th percentile fan chart and an optional annual contribution.
+- **Asset Correlation Heatmap**: Dynamic pairwise correlation matrix across your current portfolio's constituents (Quantitative Visual Suite tab).
 
 ### 3. 🏛️ Indian Tax Planning Engine (`tax_engine.py`)
 - **Capital Gains Computation**: Short-Term Capital Gains (STCG) and Long-Term Capital Gains (LTCG) across Equity, Debt, and Real Estate as per latest Indian Income Tax rules.
@@ -25,8 +25,8 @@ A comprehensive, institutional-grade Personal Wealth Management and Quantitative
 
 ### 4. 📈 Interactive Analytics & Dashboards (`app.py`)
 - Visual interactive charts powered by **Plotly**.
-- Scenario stress-testing (Market Crashes, Inflation Surges, Interest Rate Hikes).
-- Goal-based financial planning: Retirement, Child Education, Emergency Fund, Home Purchase with inflation adjustments.
+- **Scenario stress-testing**: Market Crash (-30% equity shock), Inflation Surge (-4pp real-return compression, applied uniformly), and Interest Rate Hike (+200bps duration-based haircut, applied only to debt-classified holdings) -- each reports the shocked portfolio return/value vs. your current baseline.
+- **Goal-based financial planning** (`goals_engine.py`): Retirement, Child Education, Home Purchase (shared inflation-adjusted future-value + required-monthly-SIP machinery), and Emergency Fund (a separate months-of-expenses liquidity target with no return/inflation assumption) -- each with a progress tracker against what you've already saved.
 
 ---
 
