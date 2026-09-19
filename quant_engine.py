@@ -26,6 +26,7 @@ import yfinance as yf
 import streamlit as st
 from sklearn.covariance import LedoitWolf
 from scipy.stats.mstats import winsorize
+from scipy.stats import norm
 from scipy.optimize import minimize
 from scipy import optimize
 from scipy.cluster.hierarchy import linkage, to_tree
@@ -2947,5 +2948,379 @@ def compute_zerodha_order_basket(
     leftover_cash = total_cap - total_allocated
 
     return basket_df, leftover_cash
+
+# ----------------------------------------------------------------------------------------------------
+# 8. RISK-ADJUSTED RETURN METRICS & TAIL-RISK ENGINE (SORTINO, CALMAR, TREYNOR, VAR, CVAR)
+# ----------------------------------------------------------------------------------------------------
+# Below this observation count, percentile/std-dev based statistics are too noisy to be
+# meaningful (e.g. a 5% VaR on 10 data points is asking for a single worst observation). Every
+# function in this section returns None rather than a garbage number when the input is thinner
+# than this, mirroring fetch_live_indian_risk_free_rate's (rate, is_live, source) status-flag
+# pattern -- callers decide how to render "insufficient data" rather than the function faking it.
+MIN_OBSERVATIONS_FOR_RISK_METRICS = 20
+
+
+def compute_sortino_ratio(
+    returns: pd.Series,
+    risk_free_rate: float = 0.065,
+    periods_per_year: int = 252,
+    minimum_acceptable_return: Optional[float] = None,
+) -> Optional[float]:
+    """
+    Annualized Sortino Ratio: (annualized_return - risk_free_rate) / annualized_downside_deviation.
+    Unlike Sharpe, only penalizes downside volatility. Downside deviation is the target
+    semi-deviation, computed over ALL periods (not just the sub-MAR ones) so periods above the
+    minimum acceptable return (MAR) contribute zero rather than being dropped:
+        downside_dev = sqrt( mean( min(r_i - MAR, 0)^2 ) )
+    MAR defaults to the periodic risk-free rate (risk_free_rate / periods_per_year) when
+    `minimum_acceptable_return` is not given. Both return and downside deviation are annualized
+    with the file's standard *252 / *sqrt(252) convention (see solve_portfolio_in_memory).
+    Returns None if `returns` has fewer than MIN_OBSERVATIONS_FOR_RISK_METRICS observations, and
+    np.inf if there is no downside deviation at all (every period cleared the MAR).
+    """
+    if returns is None or len(returns) < MIN_OBSERVATIONS_FOR_RISK_METRICS:
+        return None
+    r = pd.Series(returns).dropna().astype(float)
+    if len(r) < MIN_OBSERVATIONS_FOR_RISK_METRICS:
+        return None
+
+    mar = minimum_acceptable_return if minimum_acceptable_return is not None else risk_free_rate / periods_per_year
+    downside_diffs = np.minimum(r.values - mar, 0.0)
+    downside_dev = float(np.sqrt(np.mean(np.square(downside_diffs))))
+    ann_downside_dev = downside_dev * np.sqrt(periods_per_year)
+    ann_return = float(r.mean()) * periods_per_year
+
+    if ann_downside_dev <= 1e-12:
+        return np.inf
+    return float((ann_return - risk_free_rate) / ann_downside_dev)
+
+
+def compute_max_drawdown(
+    series: pd.Series,
+    input_type: str = 'prices',
+) -> Optional[Tuple[float, Any, Any]]:
+    """
+    Standard running-maximum drawdown: drawdown_t = wealth_t / running_max(wealth)_t - 1.
+    `input_type` controls how `series` is turned into a wealth index:
+      - 'prices' (default): `series` is already a price/NAV level series -- used as-is.
+      - 'returns': `series` is a periodic simple-return series, compounded into a wealth index
+        via (1 + series).cumprod() first. The running max is additionally floored at 1.0 to
+        anchor an implicit wealth=1.0 starting point immediately BEFORE the first observation
+        -- otherwise a crash in the very first period would trivially "be" the peak (nothing
+        came before it in the array) and vanish from the drawdown entirely.
+    Returns (max_drawdown_pct, peak_index, trough_index) where max_drawdown_pct is <= 0 (e.g.
+    -0.23 for a 23% peak-to-trough decline) and peak/trough_index are the series' own index
+    labels (e.g. pd.Timestamp if the series is date-indexed) at the drawdown's start and bottom.
+    peak_index is None when input_type='returns' and the drawdown's peak is that unlabeled t=0
+    anchor rather than any actual observation in `series` (i.e. wealth never rose above 1.0
+    before the trough).
+    Returns None if `series` has fewer than MIN_OBSERVATIONS_FOR_RISK_METRICS observations.
+    """
+    if series is None or len(series) < MIN_OBSERVATIONS_FOR_RISK_METRICS:
+        return None
+    s = pd.Series(series).dropna().astype(float)
+    if len(s) < MIN_OBSERVATIONS_FOR_RISK_METRICS:
+        return None
+
+    if input_type == 'returns':
+        wealth = (1.0 + s).cumprod()
+        running_max = wealth.cummax().clip(lower=1.0)
+    else:
+        wealth = s
+        running_max = wealth.cummax()
+    drawdown = wealth / running_max - 1.0
+
+    trough_idx = drawdown.idxmin()
+    max_dd = float(drawdown.loc[trough_idx])
+    pre_trough_wealth = wealth.loc[:trough_idx]
+    if input_type == 'returns' and float(pre_trough_wealth.max()) <= 1.0 + 1e-12:
+        peak_idx = None
+    else:
+        peak_idx = pre_trough_wealth.idxmax()
+    return max_dd, peak_idx, trough_idx
+
+
+def compute_calmar_ratio(returns: pd.Series, periods_per_year: int = 252) -> Optional[float]:
+    """
+    Annualized Calmar Ratio: annualized_return / abs(max_drawdown), where max_drawdown is
+    computed from the same periodic return series via compute_max_drawdown(..., input_type='returns').
+    Returns None if there is insufficient data (delegates the length check to compute_max_drawdown),
+    and np.inf if the observed max drawdown is ~0 (no decline in the sample -- an undefined
+    Calmar Ratio in the literature, but np.inf is more useful to a caller than a crash).
+    """
+    if returns is None:
+        return None
+    r = pd.Series(returns).dropna().astype(float)
+    dd_result = compute_max_drawdown(r, input_type='returns')
+    if dd_result is None:
+        return None
+    max_dd, _, _ = dd_result
+    ann_return = float(r.mean()) * periods_per_year
+
+    if abs(max_dd) <= 1e-12:
+        return np.inf
+    return float(ann_return / abs(max_dd))
+
+
+def compute_treynor_ratio(
+    portfolio_returns: pd.Series,
+    benchmark_returns: pd.Series,
+    risk_free_rate: float = 0.065,
+    periods_per_year: int = 252,
+) -> Optional[float]:
+    """
+    Annualized Treynor Ratio: (annualized_portfolio_return - risk_free_rate) / beta.
+    No beta helper exists elsewhere in this file, so beta is computed inline here as
+    Cov(portfolio, benchmark) / Var(benchmark) on the two series aligned to their common index
+    (positional if both are plain arrays/RangeIndex-backed).
+    Returns None if fewer than MIN_OBSERVATIONS_FOR_RISK_METRICS overlapping observations remain
+    after alignment, or if benchmark variance / beta is ~0 (Treynor is undefined for a
+    zero-beta or zero-variance benchmark).
+    """
+    if portfolio_returns is None or benchmark_returns is None:
+        return None
+    p = pd.Series(portfolio_returns).astype(float)
+    b = pd.Series(benchmark_returns).astype(float)
+    aligned = pd.concat([p, b], axis=1, join='inner').dropna()
+    if len(aligned) < MIN_OBSERVATIONS_FOR_RISK_METRICS:
+        return None
+
+    p_aligned = aligned.iloc[:, 0]
+    b_aligned = aligned.iloc[:, 1]
+    bench_var = float(b_aligned.var(ddof=1))
+    if bench_var <= 1e-12:
+        return None
+    beta = float(p_aligned.cov(b_aligned) / bench_var)
+    if abs(beta) <= 1e-12:
+        return None
+
+    ann_return = float(p_aligned.mean()) * periods_per_year
+    return float((ann_return - risk_free_rate) / beta)
+
+
+def compute_historical_var(returns: pd.Series, confidence: float = 0.95) -> Optional[float]:
+    """
+    Empirical (historical) Value-at-Risk via the percentile method: the periodic loss magnitude
+    at the (1 - confidence) percentile of the historical return distribution. Returned as a
+    positive number (standard VaR reporting convention -- a magnitude of loss, e.g. 0.032 means
+    a 3.2% one-period loss threshold, not a negative return).
+    Returns None if `returns` has fewer than MIN_OBSERVATIONS_FOR_RISK_METRICS observations.
+    """
+    if returns is None or len(returns) < MIN_OBSERVATIONS_FOR_RISK_METRICS:
+        return None
+    r = pd.Series(returns).dropna().astype(float)
+    if len(r) < MIN_OBSERVATIONS_FOR_RISK_METRICS:
+        return None
+
+    percentile = (1.0 - confidence) * 100.0
+    var_threshold = float(np.percentile(r.values, percentile))
+    return float(max(0.0, -var_threshold))
+
+
+def compute_parametric_var(returns: pd.Series, confidence: float = 0.95) -> Optional[float]:
+    """
+    Parametric (variance-covariance) VaR assuming normally distributed periodic returns:
+        VaR = -(mean + z * std),   z = scipy.stats.norm.ppf(1 - confidence)
+    (z is negative for confidence > 0.5, so mean + z*std is the left-tail cutoff). Returned as a
+    positive loss magnitude, matching compute_historical_var's convention.
+    Returns None if `returns` has fewer than MIN_OBSERVATIONS_FOR_RISK_METRICS observations.
+    """
+    if returns is None or len(returns) < MIN_OBSERVATIONS_FOR_RISK_METRICS:
+        return None
+    r = pd.Series(returns).dropna().astype(float)
+    if len(r) < MIN_OBSERVATIONS_FOR_RISK_METRICS:
+        return None
+
+    mean = float(r.mean())
+    std = float(r.std(ddof=1))
+    z = float(norm.ppf(1.0 - confidence))
+    var_threshold = mean + z * std
+    return float(max(0.0, -var_threshold))
+
+
+def compute_cvar(returns: pd.Series, confidence: float = 0.95) -> Optional[float]:
+    """
+    Conditional VaR / Expected Shortfall: the mean periodic loss among observations worse than
+    the historical VaR cutoff. Reuses compute_historical_var for the percentile cut rather than
+    reimplementing it, so CVaR and the VaR it's conditioned on always agree on the same
+    confidence-level threshold. Returned as a positive loss magnitude, always >= the historical
+    VaR at the same confidence level (CVaR is the average of the tail beyond VaR).
+    Returns None if `returns` has fewer than MIN_OBSERVATIONS_FOR_RISK_METRICS observations.
+    """
+    if returns is None or len(returns) < MIN_OBSERVATIONS_FOR_RISK_METRICS:
+        return None
+    r = pd.Series(returns).dropna().astype(float)
+    if len(r) < MIN_OBSERVATIONS_FOR_RISK_METRICS:
+        return None
+
+    hist_var = compute_historical_var(r, confidence=confidence)
+    if hist_var is None:
+        return None
+    tail_losses = r[r <= -hist_var]
+    if len(tail_losses) == 0:
+        return hist_var
+    return float(max(0.0, -float(tail_losses.mean())))
+
+# ----------------------------------------------------------------------------------------------------
+# 9. FORWARD-LOOKING MONTE CARLO WEALTH PROJECTION ENGINE
+# ----------------------------------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def compute_monte_carlo_wealth_projection(
+    current_value_inr: float,
+    expected_annual_return: float,
+    annual_volatility: float,
+    years: int = 20,
+    n_simulations: int = 8000,
+    annual_contribution_inr: float = 0.0,
+    contribution_timing: str = 'end',
+    seed: int = 42,
+) -> pd.DataFrame:
+    """
+    Forward-looking wealth projection via simple lognormal compounding of annual returns (one
+    lognormal draw per simulated year, chosen over a full multi-step GBM diffusion because an
+    annual step already matches GBM's terminal-wealth distribution at that horizon without
+    needing an arbitrary sub-annual step-size choice -- this IS geometric Brownian motion
+    sampled once per year rather than daily).
+    Each simulated year's annual growth factor is drawn as exp(N(mu, sigma)), with mu/sigma set
+    so the growth factor's simple-return mean/stdev match `expected_annual_return`/
+    `annual_volatility` (standard lognormal-moment-matching):
+        sigma^2 = ln(1 + volatility^2 / (1 + mean)^2)
+        mu      = ln(1 + mean) - 0.5 * sigma^2
+    The recurrence across years is sequential by construction (each year compounds on the last),
+    so it runs as a Python loop over `years` (<= 30 iterations) -- but every iteration is a
+    single vectorized numpy operation across all `n_simulations` paths at once, never a
+    scalar Python loop over simulations.
+    If `annual_contribution_inr` is given, `contribution_timing` controls when it's added:
+      - 'end' (default): added AFTER that year's growth is applied (a year-end lump sum).
+      - 'start': added BEFORE that year's growth is applied (the contribution itself grows for
+        the full year, like a SIP corpus already sitting in the market at the start of the year).
+    Returns a DataFrame indexed by year (1..years, index name 'year') with columns
+    ['p5', 'p50', 'p95'] giving the 5th/50th/95th percentile simulated wealth (INR) across
+    n_simulations paths at each year-end. Returns an empty DataFrame (same columns, no rows) if
+    `years` resolves to 0 after clamping.
+    """
+    years = int(max(0, min(30, years)))
+    if years == 0:
+        return pd.DataFrame(columns=['p5', 'p50', 'p95'])
+
+    n_simulations = int(max(100, n_simulations))
+    start_value = max(0.0, float(current_value_inr))
+    contribution = float(annual_contribution_inr)
+    mean_r = float(expected_annual_return)
+    vol_r = abs(float(annual_volatility))
+
+    var_r = vol_r ** 2
+    sigma2 = float(np.log(1.0 + var_r / max((1.0 + mean_r) ** 2, 1e-12)))
+    sigma = float(np.sqrt(max(sigma2, 0.0)))
+    mu = float(np.log(max(1.0 + mean_r, 1e-6)) - 0.5 * sigma2)
+
+    rng = np.random.default_rng(seed)
+    growth_factors = np.exp(rng.normal(loc=mu, scale=sigma, size=(n_simulations, years)))
+
+    wealth_paths = np.empty((n_simulations, years), dtype=float)
+    corpus = np.full(n_simulations, start_value, dtype=float)
+    for yr in range(years):
+        if contribution_timing == 'start':
+            corpus = (corpus + contribution) * growth_factors[:, yr]
+        else:
+            corpus = corpus * growth_factors[:, yr] + contribution
+        wealth_paths[:, yr] = corpus
+
+    percentiles = np.percentile(wealth_paths, [5, 50, 95], axis=0)
+    return pd.DataFrame(
+        {'p5': percentiles[0], 'p50': percentiles[1], 'p95': percentiles[2]},
+        index=pd.Index(np.arange(1, years + 1), name='year'),
+    )
+
+# ----------------------------------------------------------------------------------------------------
+# 10. SCENARIO STRESS-TESTING ENGINE
+# ----------------------------------------------------------------------------------------------------
+STRESS_TEST_MARKET_CRASH_EQUITY_SHOCK = -0.30   # -30% instantaneous shock to equity holdings only
+STRESS_TEST_INFLATION_SURGE_DELTA     = -0.04   # -4pp real-return compression, applied uniformly
+STRESS_TEST_RATE_HIKE_BPS             = 200     # +200bps (2.0%) parallel yield-curve shock
+STRESS_TEST_DEBT_DURATION_YEARS       = 5.0     # Approx modified duration assumed for debt holdings
+
+STRESS_TEST_SCENARIOS = ('market_crash', 'inflation_surge', 'interest_rate_hike')
+
+
+def run_portfolio_stress_test(
+    portfolio_weights: Union[Dict[str, float], pd.Series],
+    asset_returns_df: Optional[pd.DataFrame],
+    scenario: str,
+    class_map: Optional[Dict[str, str]] = None,
+) -> Dict[str, float]:
+    """
+    Applies a named one-time stress scenario as a level shock to portfolio constituent returns
+    and reports the shocked portfolio outcome vs. the unshocked baseline. Named scenarios
+    (magnitudes are the STRESS_TEST_* constants above, not buried in this function):
+      - 'market_crash': STRESS_TEST_MARKET_CRASH_EQUITY_SHOCK (-30%) applied only to holdings
+        classified 'Equity Delivery (Sec 112A)' via get_asset_class; other asset classes
+        (gold/silver, REITs, InvITs, debt) are assumed uncorrelated with an equity crash here.
+      - 'inflation_surge': STRESS_TEST_INFLATION_SURGE_DELTA (-4pp) applied uniformly across
+        every holding, modeling real-return compression from unexpected inflation.
+      - 'interest_rate_hike': a duration-based haircut of
+        -STRESS_TEST_DEBT_DURATION_YEARS * (STRESS_TEST_RATE_HIKE_BPS / 10000) applied only to
+        holdings whose get_asset_class() label contains 'Debt' (Sovereign / Liquid Debt ETFs);
+        equity, gold/silver, REIT, and InvIT holdings are unaffected by the rate shock.
+    The baseline annualized portfolio return is `weights @ (asset_returns_df.mean() * 252)`; the
+    shock is a one-time level shock (not annualized) added on top of that baseline to produce the
+    shocked figure, matching how a real market/rate shock hits realized value once, not per year.
+    Returns a dict: {'scenario', 'baseline_annual_return', 'shocked_annual_return',
+    'delta_annual_return', 'baseline_portfolio_value' (normalized to 1.0),
+    'shocked_portfolio_value', 'value_delta_pct'}.
+    Gracefully returns an all-zero result for an empty `portfolio_weights`. Raises ValueError for
+    an unrecognized `scenario` name.
+    """
+    if scenario not in STRESS_TEST_SCENARIOS:
+        raise ValueError(f"Unknown stress scenario '{scenario}'. Valid scenarios: {STRESS_TEST_SCENARIOS}")
+
+    weights = pd.Series(portfolio_weights, dtype=float) if not isinstance(portfolio_weights, pd.Series) \
+        else portfolio_weights.astype(float)
+    tickers = list(weights.index)
+
+    if not tickers:
+        return {
+            'scenario': scenario,
+            'baseline_annual_return': 0.0,
+            'shocked_annual_return': 0.0,
+            'delta_annual_return': 0.0,
+            'baseline_portfolio_value': 1.0,
+            'shocked_portfolio_value': 1.0,
+            'value_delta_pct': 0.0,
+        }
+
+    if asset_returns_df is None or asset_returns_df.empty:
+        mean_returns = pd.Series(0.0, index=tickers)
+    else:
+        mean_returns = asset_returns_df.reindex(columns=tickers).mean().fillna(0.0) * 252
+
+    baseline_annual_return = float((weights * mean_returns).sum())
+
+    shocks = pd.Series(0.0, index=tickers)
+    if scenario == 'market_crash':
+        for t in tickers:
+            if get_asset_class(t, class_map) == 'Equity Delivery (Sec 112A)':
+                shocks[t] = STRESS_TEST_MARKET_CRASH_EQUITY_SHOCK
+    elif scenario == 'inflation_surge':
+        shocks[:] = STRESS_TEST_INFLATION_SURGE_DELTA
+    else:  # 'interest_rate_hike'
+        duration_shock = -STRESS_TEST_DEBT_DURATION_YEARS * (STRESS_TEST_RATE_HIKE_BPS / 10000.0)
+        for t in tickers:
+            if 'Debt' in get_asset_class(t, class_map):
+                shocks[t] = duration_shock
+
+    portfolio_shock = float((weights * shocks).sum())
+    shocked_annual_return = baseline_annual_return + portfolio_shock
+    shocked_value = 1.0 * (1.0 + portfolio_shock)
+
+    return {
+        'scenario': scenario,
+        'baseline_annual_return': baseline_annual_return,
+        'shocked_annual_return': shocked_annual_return,
+        'delta_annual_return': shocked_annual_return - baseline_annual_return,
+        'baseline_portfolio_value': 1.0,
+        'shocked_portfolio_value': shocked_value,
+        'value_delta_pct': portfolio_shock,
+    }
 
 

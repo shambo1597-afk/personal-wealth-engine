@@ -31,6 +31,19 @@ from quant_engine import (
     solve_portfolio_in_memory,
     fetch_live_dynamic_multiasset_universe,
     get_asset_class,
+    MIN_OBSERVATIONS_FOR_RISK_METRICS,
+    compute_sortino_ratio,
+    compute_max_drawdown,
+    compute_calmar_ratio,
+    compute_treynor_ratio,
+    compute_historical_var,
+    compute_parametric_var,
+    compute_cvar,
+    compute_monte_carlo_wealth_projection,
+    STRESS_TEST_SCENARIOS,
+    STRESS_TEST_MARKET_CRASH_EQUITY_SHOCK,
+    STRESS_TEST_INFLATION_SURGE_DELTA,
+    run_portfolio_stress_test,
 )
 
 
@@ -959,4 +972,253 @@ class TestDynamicMultiAssetDiscovery:
         assert health['equities_source'] == 'failed'
         assert health['etf_source'] == 'failed'
         assert health['equities_count'] == 0
+
+
+def _synthetic_returns(n: int = 300, mean: float = 0.0006, std: float = 0.012, seed: int = 7) -> pd.Series:
+    rng = np.random.default_rng(seed)
+    return pd.Series(rng.normal(mean, std, n))
+
+
+class TestSortinoRatio:
+    def test_insufficient_observations_returns_none(self):
+        r = _synthetic_returns(n=MIN_OBSERVATIONS_FOR_RISK_METRICS - 1)
+        assert compute_sortino_ratio(r, risk_free_rate=0.065) is None
+
+    def test_no_downside_periods_returns_inf(self):
+        r = pd.Series([0.01] * 30)
+        assert compute_sortino_ratio(r, risk_free_rate=0.0) == float('inf')
+
+    def test_worse_downside_dispersion_lowers_the_ratio(self):
+        # Same mean/MAR, but one series has fatter downside tails -- its Sortino must be lower.
+        calm = pd.Series([0.001, 0.0005, -0.001, 0.0005] * 10)
+        volatile = pd.Series([0.001, 0.0005, -0.05, 0.0505] * 10)
+        assert compute_sortino_ratio(volatile, risk_free_rate=0.0) < compute_sortino_ratio(calm, risk_free_rate=0.0)
+
+    def test_matches_hand_computed_value_on_a_small_series(self):
+        # MAR = 0. Downside diffs: [-0.02, 0, -0.01, 0] repeated 8x (32 obs).
+        r = pd.Series([-0.02, 0.03, -0.01, 0.04] * 8)
+        downside_dev = np.sqrt(np.mean(np.square(np.minimum(r.values, 0.0)))) * np.sqrt(252)
+        ann_ret = r.mean() * 252
+        expected = (ann_ret - 0.0) / downside_dev
+        assert compute_sortino_ratio(r, risk_free_rate=0.0, minimum_acceptable_return=0.0) == pytest.approx(expected)
+
+
+class TestMaxDrawdown:
+    def test_insufficient_observations_returns_none(self):
+        prices = pd.Series(np.linspace(100, 110, MIN_OBSERVATIONS_FOR_RISK_METRICS - 1))
+        assert compute_max_drawdown(prices) is None
+
+    def test_known_peak_to_trough_decline_on_a_price_series(self):
+        # Rises to 120 (peak, idx 4), falls to 90 (trough, idx 9) -- a -25% drawdown.
+        prices = pd.Series([100, 105, 110, 115, 120, 110, 100, 95, 92, 90, 95, 100, 105, 110, 115, 120, 118, 116, 119, 121, 122])
+        result = compute_max_drawdown(prices)
+        assert result is not None
+        max_dd, peak_idx, trough_idx = result
+        assert max_dd == pytest.approx((90.0 / 120.0) - 1.0)
+        assert peak_idx == 4
+        assert trough_idx == 9
+
+    def test_returns_input_type_compounds_before_measuring_drawdown(self):
+        # A -10% then a further -10% period compounds to a larger drawdown than a flat -20%.
+        rets = pd.Series([-0.10, -0.10] + [0.0] * 18)
+        result = compute_max_drawdown(rets, input_type='returns')
+        assert result is not None
+        max_dd, _, _ = result
+        assert max_dd == pytest.approx((0.9 * 0.9) - 1.0)
+
+    def test_monotonically_rising_series_has_zero_drawdown(self):
+        prices = pd.Series(np.linspace(100, 200, 25))
+        max_dd, _, _ = compute_max_drawdown(prices)
+        assert max_dd == pytest.approx(0.0)
+
+
+class TestCalmarRatio:
+    def test_insufficient_observations_returns_none(self):
+        r = _synthetic_returns(n=MIN_OBSERVATIONS_FOR_RISK_METRICS - 1)
+        assert compute_calmar_ratio(r) is None
+
+    def test_zero_drawdown_returns_inf(self):
+        r = pd.Series([0.001] * 30)
+        assert compute_calmar_ratio(r) == float('inf')
+
+    def test_matches_annualized_return_over_abs_max_drawdown(self):
+        r = _synthetic_returns(n=250, seed=11)
+        max_dd, _, _ = compute_max_drawdown(r, input_type='returns')
+        expected = (r.mean() * 252) / abs(max_dd)
+        assert compute_calmar_ratio(r) == pytest.approx(expected)
+
+
+class TestTreynorRatio:
+    def test_insufficient_observations_returns_none(self):
+        p = _synthetic_returns(n=MIN_OBSERVATIONS_FOR_RISK_METRICS - 1, seed=1)
+        b = _synthetic_returns(n=MIN_OBSERVATIONS_FOR_RISK_METRICS - 1, seed=2)
+        assert compute_treynor_ratio(p, b, risk_free_rate=0.065) is None
+
+    def test_zero_variance_benchmark_returns_none(self):
+        p = _synthetic_returns(n=100, seed=3)
+        b = pd.Series([0.0005] * 100)
+        assert compute_treynor_ratio(p, b, risk_free_rate=0.065) is None
+
+    def test_beta_one_tracker_matches_simple_excess_return_over_beta(self):
+        # Portfolio is an exact clone of the benchmark (beta == 1.0) -- Treynor collapses to
+        # the same excess-return numerator as Sharpe would use, but divided by beta=1.
+        b = _synthetic_returns(n=200, seed=4)
+        p = b.copy()
+        result = compute_treynor_ratio(p, b, risk_free_rate=0.065)
+        expected = (b.mean() * 252) - 0.065
+        assert result == pytest.approx(expected, rel=1e-6)
+
+
+class TestValueAtRiskAndCVaR:
+    def test_insufficient_observations_returns_none(self):
+        r = _synthetic_returns(n=MIN_OBSERVATIONS_FOR_RISK_METRICS - 1)
+        assert compute_historical_var(r) is None
+        assert compute_parametric_var(r) is None
+        assert compute_cvar(r) is None
+
+    def test_historical_var_is_a_positive_loss_magnitude(self):
+        r = _synthetic_returns(n=500, mean=0.0002, std=0.02, seed=5)
+        var95 = compute_historical_var(r, confidence=0.95)
+        assert var95 is not None and var95 > 0
+
+    def test_higher_confidence_yields_a_larger_var(self):
+        r = _synthetic_returns(n=500, mean=0.0002, std=0.02, seed=6)
+        var95 = compute_historical_var(r, confidence=0.95)
+        var99 = compute_historical_var(r, confidence=0.99)
+        assert var99 > var95
+
+    def test_parametric_var_matches_hand_computed_normal_quantile(self):
+        from scipy.stats import norm
+        r = _synthetic_returns(n=500, mean=0.0002, std=0.02, seed=8)
+        expected = -(r.mean() + norm.ppf(0.05) * r.std(ddof=1))
+        assert compute_parametric_var(r, confidence=0.95) == pytest.approx(max(0.0, expected))
+
+    def test_cvar_is_at_least_as_large_as_historical_var(self):
+        r = _synthetic_returns(n=500, mean=0.0002, std=0.02, seed=9)
+        var95 = compute_historical_var(r, confidence=0.95)
+        cvar95 = compute_cvar(r, confidence=0.95)
+        assert cvar95 >= var95
+
+    def test_cvar_reuses_historical_var_rather_than_reimplementing_it(self, monkeypatch):
+        import quant_engine
+        calls = []
+        original = quant_engine.compute_historical_var
+
+        def _spy(returns, confidence=0.95):
+            calls.append(confidence)
+            return original(returns, confidence=confidence)
+
+        monkeypatch.setattr(quant_engine, 'compute_historical_var', _spy)
+        r = _synthetic_returns(n=200, seed=10)
+        quant_engine.compute_cvar(r, confidence=0.9)
+        assert 0.9 in calls
+
+
+class TestMonteCarloWealthProjection:
+    def test_returns_dataframe_indexed_by_year_with_percentile_columns(self):
+        df = compute_monte_carlo_wealth_projection(
+            current_value_inr=1_000_000.0, expected_annual_return=0.10, annual_volatility=0.15,
+            years=10, n_simulations=1000,
+        )
+        assert list(df.columns) == ['p5', 'p50', 'p95']
+        assert list(df.index) == list(range(1, 11))
+        assert df.index.name == 'year'
+
+    def test_percentiles_are_ordered_every_year(self):
+        df = compute_monte_carlo_wealth_projection(
+            current_value_inr=500_000.0, expected_annual_return=0.12, annual_volatility=0.20,
+            years=15, n_simulations=2000,
+        )
+        assert (df['p5'] <= df['p50']).all()
+        assert (df['p50'] <= df['p95']).all()
+
+    def test_years_clamped_to_1_30_range(self):
+        df_over = compute_monte_carlo_wealth_projection(
+            current_value_inr=100_000.0, expected_annual_return=0.10, annual_volatility=0.15, years=99, n_simulations=500,
+        )
+        assert len(df_over) == 30
+
+    def test_annual_contribution_increases_terminal_median_wealth(self):
+        no_contrib = compute_monte_carlo_wealth_projection(
+            current_value_inr=1_000_000.0, expected_annual_return=0.10, annual_volatility=0.15,
+            years=10, n_simulations=3000, annual_contribution_inr=0.0,
+        )
+        with_contrib = compute_monte_carlo_wealth_projection(
+            current_value_inr=1_000_000.0, expected_annual_return=0.10, annual_volatility=0.15,
+            years=10, n_simulations=3000, annual_contribution_inr=200_000.0,
+        )
+        assert with_contrib['p50'].iloc[-1] > no_contrib['p50'].iloc[-1]
+
+    def test_zero_volatility_collapses_to_deterministic_compounding(self):
+        df = compute_monte_carlo_wealth_projection(
+            current_value_inr=1_000_000.0, expected_annual_return=0.10, annual_volatility=0.0,
+            years=5, n_simulations=500,
+        )
+        expected_terminal = 1_000_000.0 * (1.10 ** 5)
+        assert df['p50'].iloc[-1] == pytest.approx(expected_terminal, rel=1e-6)
+        assert df['p5'].iloc[-1] == pytest.approx(df['p95'].iloc[-1], rel=1e-6)
+
+    def test_start_vs_end_contribution_timing_changes_terminal_wealth(self):
+        end_timing = compute_monte_carlo_wealth_projection(
+            current_value_inr=100_000.0, expected_annual_return=0.10, annual_volatility=0.0,
+            years=3, n_simulations=100, annual_contribution_inr=50_000.0, contribution_timing='end',
+        )
+        start_timing = compute_monte_carlo_wealth_projection(
+            current_value_inr=100_000.0, expected_annual_return=0.10, annual_volatility=0.0,
+            years=3, n_simulations=100, annual_contribution_inr=50_000.0, contribution_timing='start',
+        )
+        # A contribution that grows for the full year (start-timing) compounds to more.
+        assert start_timing['p50'].iloc[-1] > end_timing['p50'].iloc[-1]
+
+
+class TestPortfolioStressTest:
+    def test_unknown_scenario_raises_value_error(self):
+        with pytest.raises(ValueError):
+            run_portfolio_stress_test(pd.Series({'TCS.NS': 1.0}), pd.DataFrame({'TCS.NS': [0.001] * 30}), 'made_up_scenario')
+
+    def test_empty_portfolio_returns_zeroed_result_without_crashing(self):
+        result = run_portfolio_stress_test(pd.Series(dtype=float), pd.DataFrame(), 'market_crash')
+        assert result['baseline_annual_return'] == 0.0
+        assert result['shocked_annual_return'] == 0.0
+        assert result['value_delta_pct'] == 0.0
+
+    def test_market_crash_hits_only_equity_holdings(self):
+        weights = pd.Series({'TCS.NS': 0.5, 'GILT5YBEES.NS': 0.5})
+        returns = pd.DataFrame({
+            'TCS.NS': [0.0006] * 30,
+            'GILT5YBEES.NS': [0.0002] * 30,
+        })
+        result = run_portfolio_stress_test(weights, returns, 'market_crash')
+        # Only the 50% equity sleeve takes the -30% shock -> portfolio-level shock = -15%.
+        assert result['value_delta_pct'] == pytest.approx(0.5 * STRESS_TEST_MARKET_CRASH_EQUITY_SHOCK)
+
+    def test_inflation_surge_hits_every_holding_uniformly(self):
+        weights = pd.Series({'TCS.NS': 0.5, 'GILT5YBEES.NS': 0.5})
+        returns = pd.DataFrame({
+            'TCS.NS': [0.0006] * 30,
+            'GILT5YBEES.NS': [0.0002] * 30,
+        })
+        result = run_portfolio_stress_test(weights, returns, 'inflation_surge')
+        assert result['value_delta_pct'] == pytest.approx(STRESS_TEST_INFLATION_SURGE_DELTA)
+
+    def test_rate_hike_hits_only_debt_classified_holdings(self):
+        weights = pd.Series({'TCS.NS': 0.5, 'GILT5YBEES.NS': 0.5})
+        returns = pd.DataFrame({
+            'TCS.NS': [0.0006] * 30,
+            'GILT5YBEES.NS': [0.0002] * 30,
+        })
+        # TCS.NS is unclassified -> falls through get_asset_class's default 'Equity Delivery
+        # (Sec 112A)' branch; GILT5YBEES.NS matches the sovereign-bond-ticker branch.
+        result_equity_leg = run_portfolio_stress_test(weights, returns, 'interest_rate_hike')
+        assert result_equity_leg['value_delta_pct'] < 0.0
+        # An all-equity portfolio must see zero shock from a rate hike in this model.
+        all_equity = run_portfolio_stress_test(pd.Series({'TCS.NS': 1.0}), returns[['TCS.NS']], 'interest_rate_hike')
+        assert all_equity['value_delta_pct'] == pytest.approx(0.0)
+
+    def test_scenario_name_is_echoed_in_the_result(self):
+        weights = pd.Series({'TCS.NS': 1.0})
+        returns = pd.DataFrame({'TCS.NS': [0.0006] * 30})
+        for scenario in STRESS_TEST_SCENARIOS:
+            result = run_portfolio_stress_test(weights, returns, scenario)
+            assert result['scenario'] == scenario
 
