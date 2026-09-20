@@ -93,6 +93,19 @@ def init_db() -> None:
                 fees_estimated REAL
             )
         """)
+        # Table 3: Core/Satellite position classification, keyed by ticker (not lot_id) -- this is
+        # a per-position attribute, not a per-lot one, and tax_lots is normalized per-lot (one row
+        # per buy transaction, so a single ticker can span many rows). A new column on tax_lots
+        # would have to be kept in sync across every lot of the same ticker on every edit; a small
+        # ticker-keyed table avoids that duplication entirely. Untagged tickers default to 'core'
+        # in get_position_classification() below (not enforced here) so existing holdings are
+        # never silently orphaned by this migration.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS position_classification (
+                ticker TEXT PRIMARY KEY,
+                classification TEXT NOT NULL DEFAULT 'core'
+            )
+        """)
         # Database Performance Indexes
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tax_lots_ticker ON tax_lots(ticker);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tax_lots_qty ON tax_lots(quantity);")
@@ -933,3 +946,64 @@ def compile_xirr_cash_flows(
         'dates': dates,
         'cfs': cfs
     }
+
+# ----------------------------------------------------------------------------------------------------
+# 6. CORE / SATELLITE POSITION CLASSIFICATION
+# ----------------------------------------------------------------------------------------------------
+VALID_POSITION_CLASSIFICATIONS = {'core', 'satellite'}
+DEFAULT_POSITION_CLASSIFICATION = 'core'
+
+
+def get_position_classification(ticker: str, conn: Optional[sqlite3.Connection] = None) -> str:
+    """
+    Returns the stored core/satellite tag for `ticker`, defaulting to DEFAULT_POSITION_
+    CLASSIFICATION ('core') if the ticker has never been explicitly tagged -- so a pre-existing
+    holding from before this feature shipped, or a freshly-imported one, is never silently
+    dropped out of the core/satellite split; it just starts on the conservative side until the
+    user tags it.
+    """
+    should_close = False
+    if conn is None:
+        conn = get_db_connection()
+        should_close = True
+    try:
+        row = conn.execute(
+            "SELECT classification FROM position_classification WHERE ticker = ?", (ticker,)
+        ).fetchone()
+        return row[0] if row else DEFAULT_POSITION_CLASSIFICATION
+    finally:
+        if should_close:
+            conn.close()
+
+
+def set_position_classification(ticker: str, classification: str, conn: Optional[sqlite3.Connection] = None) -> None:
+    """
+    Tags `ticker` as 'core' or 'satellite' (upsert -- creates the row if untagged, overwrites it
+    if not). Rejects (raises ValueError) any value outside {'core', 'satellite'} rather than
+    silently coercing or truncating it -- an unrecognized tag silently corrupting the core/
+    satellite split downstream would be worse than a loud failure right here at write time.
+    """
+    if classification not in VALID_POSITION_CLASSIFICATIONS:
+        raise ValueError(
+            f"Invalid classification {classification!r} for {ticker!r} -- must be one of "
+            f"{sorted(VALID_POSITION_CLASSIFICATIONS)}."
+        )
+    should_close = False
+    if conn is None:
+        conn = get_db_connection()
+        should_close = True
+    try:
+        conn.execute(
+            """
+            INSERT INTO position_classification (ticker, classification) VALUES (?, ?)
+            ON CONFLICT(ticker) DO UPDATE SET classification = excluded.classification
+            """,
+            (ticker, classification),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        if should_close:
+            conn.close()

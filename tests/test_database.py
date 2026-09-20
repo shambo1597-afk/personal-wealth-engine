@@ -202,3 +202,57 @@ class TestKiteHoldingsSync:
             assert res['imported_count'] == 0
         finally:
             conn.close()
+
+
+class TestPositionClassification:
+    def test_untagged_ticker_defaults_to_core(self, isolated_db):
+        # An existing holding from before this feature shipped (or a freshly-imported one) must
+        # never be silently orphaned out of the core/satellite split -- it defaults conservatively.
+        assert isolated_db.get_position_classification('TCS.NS') == 'core'
+
+    def test_set_then_get_round_trips(self, isolated_db):
+        isolated_db.set_position_classification('TCS.NS', 'satellite')
+        assert isolated_db.get_position_classification('TCS.NS') == 'satellite'
+
+    def test_set_overwrites_previous_tag(self, isolated_db):
+        isolated_db.set_position_classification('TCS.NS', 'satellite')
+        isolated_db.set_position_classification('TCS.NS', 'core')
+        assert isolated_db.get_position_classification('TCS.NS') == 'core'
+
+    def test_invalid_classification_raises_rather_than_coercing(self, isolated_db):
+        with pytest.raises(ValueError):
+            isolated_db.set_position_classification('TCS.NS', 'growth')
+        # The rejected write must not have silently landed under some coerced value --
+        # the ticker should still read back as the untagged default.
+        assert isolated_db.get_position_classification('TCS.NS') == 'core'
+
+    def test_empty_string_classification_raises(self, isolated_db):
+        with pytest.raises(ValueError):
+            isolated_db.set_position_classification('TCS.NS', '')
+
+    def test_case_sensitive_rejection(self, isolated_db):
+        # 'Core' / 'SATELLITE' etc. must be rejected, not silently normalized -- exactly
+        # {'core', 'satellite'} means exactly those two strings.
+        with pytest.raises(ValueError):
+            isolated_db.set_position_classification('TCS.NS', 'Core')
+
+    def test_classifications_are_independent_per_ticker(self, isolated_db):
+        isolated_db.set_position_classification('TCS.NS', 'satellite')
+        isolated_db.set_position_classification('INFY.NS', 'core')
+        assert isolated_db.get_position_classification('TCS.NS') == 'satellite'
+        assert isolated_db.get_position_classification('INFY.NS') == 'core'
+        # A third, never-touched ticker still gets the untagged default.
+        assert isolated_db.get_position_classification('HDFCBANK.NS') == 'core'
+
+    def test_uses_caller_supplied_connection_without_closing_it(self, isolated_db):
+        # Matches the optional-conn pattern used elsewhere in database.py (e.g.
+        # reconcile_corporate_actions_and_splits) -- passing an existing connection must not
+        # leave it closed behind the caller's back.
+        conn = isolated_db.get_db_connection()
+        try:
+            isolated_db.set_position_classification('TCS.NS', 'satellite', conn=conn)
+            assert isolated_db.get_position_classification('TCS.NS', conn=conn) == 'satellite'
+            # conn must still be usable -- a trivial query should not raise.
+            conn.execute("SELECT 1").fetchone()
+        finally:
+            conn.close()

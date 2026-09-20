@@ -46,6 +46,13 @@ from quant_engine import (
     run_portfolio_stress_test,
     compute_institutional_accumulation_factor,
     compute_inverse_herfindahl_index,
+    compute_core_satellite_split,
+    compute_growth_quality_quadrant,
+    QUADRANT_HIGH_GROWTH_HIGH_RETURNS,
+    QUADRANT_HIGH_GROWTH_LOW_RETURNS,
+    QUADRANT_LOW_GROWTH_HIGH_RETURNS,
+    QUADRANT_LOW_GROWTH_LOW_RETURNS,
+    QUADRANT_INSUFFICIENT_DATA,
 )
 
 
@@ -564,7 +571,7 @@ def _mock_yf_statements(periods):
     are actually present in a real yfinance response for that statement type.
     """
     bs_rows = ['Total Assets', 'Stockholders Equity', 'Total Debt', 'Current Assets', 'Current Liabilities']
-    inc_rows = ['Total Revenue', 'Net Income', 'Gross Profit', 'Basic Average Shares']
+    inc_rows = ['Total Revenue', 'Net Income', 'Gross Profit', 'Basic Average Shares', 'EBIT']
     cf_rows = ['Operating Cash Flow']
 
     def _build(rows):
@@ -618,6 +625,90 @@ class TestYFinanceFundamentals:
         # NI > 0 -- every one of the 9 canonical Piotroski criteria is genuinely earned.
         assert res['piotroski_f_score'] == 9
         assert res['piotroski_criteria_available'] == 9
+
+    def test_roce_and_earnings_growth_derived_from_already_fetched_statements(self, monkeypatch):
+        # ROCE = EBIT / (Total Assets - Current Liabilities); Earnings Growth = YoY Net Income
+        # delta -- both derived from rows already pulled for the Piotroski/DuPont calc above
+        # (EBIT is the one new row extraction; Capital Employed reuses Total Assets/Current
+        # Liabilities already fetched; growth reuses Net Income already fetched for both years).
+        periods = {
+            pd.Timestamp('2024-03-31'): {
+                'Total Assets': 1_000_000, 'Stockholders Equity': 600_000, 'Total Debt': 50_000,
+                'Current Assets': 500_000, 'Current Liabilities': 150_000,
+                'Total Revenue': 1_200_000, 'Net Income': 120_000, 'Gross Profit': 400_000,
+                'Basic Average Shares': 1000, 'Operating Cash Flow': 200_000, 'EBIT': 180_000,
+            },
+            pd.Timestamp('2023-03-31'): {
+                'Total Assets': 900_000, 'Stockholders Equity': 550_000, 'Total Debt': 60_000,
+                'Current Assets': 400_000, 'Current Liabilities': 140_000,
+                'Total Revenue': 1_000_000, 'Net Income': 100_000, 'Gross Profit': 300_000,
+                'Basic Average Shares': 1000, 'Operating Cash Flow': 95_000, 'EBIT': 150_000,
+            },
+        }
+        bs, inc, cf = _mock_yf_statements(periods)
+        mock_ticker = _MockYfTicker(bs, inc, cf, info={'trailingPE': 23.5})
+
+        import quant_engine
+        monkeypatch.setattr(quant_engine.yf, 'Ticker', lambda ticker: mock_ticker)
+
+        res = fetch_yfinance_fundamentals('TESTCO.NS')
+        assert res is not None
+        # Capital Employed = 1,000,000 - 150,000 = 850,000; ROCE = 180,000 / 850,000 * 100
+        assert res['roce_num'] == pytest.approx(180_000 / 850_000 * 100.0)
+        # Earnings Growth = (120,000 - 100,000) / 100,000 * 100
+        assert res['earnings_growth_num'] == pytest.approx(20.0)
+
+    def test_roce_is_none_when_ebit_row_is_absent_not_fabricated(self, monkeypatch):
+        # A ticker whose income statement has no EBIT/Operating Income/Pretax Income row at all
+        # (or, per the docstring, a bank where Current Liabilities is structurally absent) must
+        # get roce_num=None, never a value computed from a missing row treated as zero.
+        periods = {
+            pd.Timestamp('2024-03-31'): {
+                'Total Assets': 1_000_000, 'Stockholders Equity': 600_000, 'Total Debt': 50_000,
+                'Current Assets': 500_000, 'Current Liabilities': 150_000,
+                'Total Revenue': 1_200_000, 'Net Income': 120_000, 'Gross Profit': 400_000,
+                'Basic Average Shares': 1000, 'Operating Cash Flow': 200_000,
+                # No 'EBIT' key -- absent from this ticker's real statement.
+            },
+            pd.Timestamp('2023-03-31'): {
+                'Total Assets': 900_000, 'Stockholders Equity': 550_000, 'Total Debt': 60_000,
+                'Current Assets': 400_000, 'Current Liabilities': 140_000,
+                'Total Revenue': 1_000_000, 'Net Income': 100_000, 'Gross Profit': 300_000,
+                'Basic Average Shares': 1000, 'Operating Cash Flow': 95_000,
+            },
+        }
+        bs, inc, cf = _mock_yf_statements(periods)
+        mock_ticker = _MockYfTicker(bs, inc, cf, info={})
+
+        import quant_engine
+        monkeypatch.setattr(quant_engine.yf, 'Ticker', lambda ticker: mock_ticker)
+
+        res = fetch_yfinance_fundamentals('TESTCO.NS')
+        assert res is not None
+        assert res['roce_num'] is None
+        # Earnings growth has no EBIT dependency -- still computed from Net Income alone.
+        assert res['earnings_growth_num'] == pytest.approx(20.0)
+
+    def test_earnings_growth_is_none_without_a_prior_year(self, monkeypatch):
+        periods = {
+            pd.Timestamp('2024-03-31'): {
+                'Total Assets': 1_000_000, 'Stockholders Equity': 600_000, 'Total Debt': 50_000,
+                'Current Assets': 500_000, 'Current Liabilities': 150_000,
+                'Total Revenue': 1_200_000, 'Net Income': 120_000, 'Gross Profit': 400_000,
+                'Basic Average Shares': 1000, 'Operating Cash Flow': 200_000, 'EBIT': 180_000,
+            },
+        }
+        bs, inc, cf = _mock_yf_statements(periods)
+        mock_ticker = _MockYfTicker(bs, inc, cf, info={})
+
+        import quant_engine
+        monkeypatch.setattr(quant_engine.yf, 'Ticker', lambda ticker: mock_ticker)
+
+        res = fetch_yfinance_fundamentals('TESTCO.NS')
+        assert res is not None
+        assert res['earnings_growth_num'] is None
+        # ROCE has no prior-year dependency -- still computed from this year's statements alone.
+        assert res['roce_num'] == pytest.approx(180_000 / (1_000_000 - 150_000) * 100.0)
 
     def test_financial_institution_missing_rows_is_exempted_not_penalized(self, monkeypatch):
         # HDFCBANK.NS's real balance sheet has no Current Assets/Current Liabilities values and
@@ -1181,6 +1272,144 @@ class TestInverseHerfindahlIndex:
         assert compute_inverse_herfindahl_index(weights_dict) == pytest.approx(
             compute_inverse_herfindahl_index(weights_series)
         )
+
+
+class TestCoreSatelliteSplit:
+    def test_basic_split_by_value_and_count(self):
+        result = compute_core_satellite_split(
+            {'A': 700000.0, 'B': 300000.0},
+            {'A': 'core', 'B': 'satellite'},
+        )
+        assert result['core_value'] == pytest.approx(700000.0)
+        assert result['satellite_value'] == pytest.approx(300000.0)
+        assert result['core_pct'] == pytest.approx(0.7)
+        assert result['satellite_pct'] == pytest.approx(0.3)
+        assert result['core_count'] == 1
+        assert result['satellite_count'] == 1
+
+    def test_untagged_ticker_with_value_defaults_to_core(self):
+        # Matches database.DEFAULT_POSITION_CLASSIFICATION -- an untagged holding must never be
+        # silently dropped from the split.
+        result = compute_core_satellite_split(
+            {'A': 500000.0, 'B': 500000.0},
+            {'A': 'satellite'},  # 'B' has no entry at all
+        )
+        assert result['core_count'] == 1
+        assert result['satellite_count'] == 1
+        assert result['core_value'] == pytest.approx(500000.0)
+
+    def test_zero_value_ticker_is_excluded_despite_having_a_classification(self):
+        result = compute_core_satellite_split(
+            {'A': 0.0, 'B': 100000.0},
+            {'A': 'satellite', 'B': 'core'},
+        )
+        assert result['satellite_count'] == 0
+        assert result['satellite_value'] == pytest.approx(0.0)
+        assert result['core_count'] == 1
+
+    def test_negative_or_missing_value_is_excluded_not_counted_as_zero_weight(self):
+        result = compute_core_satellite_split(
+            {'A': -100.0, 'B': None, 'C': 50000.0},
+            {'A': 'core', 'B': 'core', 'C': 'satellite'},
+        )
+        assert result['core_count'] == 0
+        assert result['satellite_count'] == 1
+        assert result['satellite_pct'] == pytest.approx(1.0)
+
+    def test_empty_holdings_returns_all_zeros_not_a_crash(self):
+        result = compute_core_satellite_split({}, {})
+        assert result == {
+            'core_value': 0.0, 'satellite_value': 0.0,
+            'core_pct': 0.0, 'satellite_pct': 0.0,
+            'core_count': 0, 'satellite_count': 0,
+        }
+
+    def test_all_core_portfolio_has_zero_satellite_pct(self):
+        result = compute_core_satellite_split(
+            {'A': 100000.0, 'B': 200000.0}, {'A': 'core', 'B': 'core'}
+        )
+        assert result['satellite_pct'] == pytest.approx(0.0)
+        assert result['core_pct'] == pytest.approx(1.0)
+
+    def test_unrecognized_classification_string_falls_back_to_core(self):
+        # Defense in depth -- database.set_position_classification already rejects anything
+        # outside {'core', 'satellite'} at write time, but this function must not crash or
+        # misclassify if it ever sees something else.
+        result = compute_core_satellite_split({'A': 100000.0}, {'A': 'growth'})
+        assert result['core_count'] == 1
+        assert result['satellite_count'] == 0
+
+
+def _fundamentals_df(rows):
+    return pd.DataFrame(rows)
+
+
+class TestGrowthQualityQuadrant:
+    def test_all_four_quadrants_assigned_correctly_by_universe_median(self):
+        # Medians: roce -> (30, 28, 5, 4) => median 17.0; growth -> (25, 5, 22, 3) => median 13.5.
+        # A: roce 30>=17, growth 25>=13.5 -> High Growth + High Returns
+        # B: roce 28>=17, growth 5<13.5   -> Low Growth + High Returns
+        # C: roce 5<17,   growth 22>=13.5 -> High Growth + Low Returns
+        # D: roce 4<17,   growth 3<13.5   -> Low Growth + Low Returns
+        df = _fundamentals_df([
+            {'Ticker': 'A.NS', 'roce_num': 30.0, 'earnings_growth_num': 25.0},
+            {'Ticker': 'B.NS', 'roce_num': 28.0, 'earnings_growth_num': 5.0},
+            {'Ticker': 'C.NS', 'roce_num': 5.0, 'earnings_growth_num': 22.0},
+            {'Ticker': 'D.NS', 'roce_num': 4.0, 'earnings_growth_num': 3.0},
+        ])
+        result = compute_growth_quality_quadrant(df).set_index('Ticker')
+        assert result.loc['A.NS', 'Quadrant'] == QUADRANT_HIGH_GROWTH_HIGH_RETURNS
+        assert result.loc['B.NS', 'Quadrant'] == QUADRANT_LOW_GROWTH_HIGH_RETURNS
+        assert result.loc['C.NS', 'Quadrant'] == QUADRANT_HIGH_GROWTH_LOW_RETURNS
+        assert result.loc['D.NS', 'Quadrant'] == QUADRANT_LOW_GROWTH_LOW_RETURNS
+
+    def test_missing_roce_excludes_from_quadrant_and_median(self):
+        df = _fundamentals_df([
+            {'Ticker': 'A.NS', 'roce_num': 30.0, 'earnings_growth_num': 25.0},
+            {'Ticker': 'B.NS', 'roce_num': None, 'earnings_growth_num': 10.0},
+        ])
+        result = compute_growth_quality_quadrant(df).set_index('Ticker')
+        assert result.loc['B.NS', 'Quadrant'] == QUADRANT_INSUFFICIENT_DATA
+
+    def test_missing_earnings_growth_excludes_from_quadrant_and_median(self):
+        df = _fundamentals_df([
+            {'Ticker': 'A.NS', 'roce_num': 30.0, 'earnings_growth_num': 25.0},
+            {'Ticker': 'B.NS', 'roce_num': 20.0, 'earnings_growth_num': np.nan},
+        ])
+        result = compute_growth_quality_quadrant(df).set_index('Ticker')
+        assert result.loc['B.NS', 'Quadrant'] == QUADRANT_INSUFFICIENT_DATA
+
+    def test_insufficient_data_rows_do_not_skew_the_median(self):
+        # Two valid tickers (median of roce = 15) plus a garbage row that must not shift it.
+        df = _fundamentals_df([
+            {'Ticker': 'A.NS', 'roce_num': 10.0, 'earnings_growth_num': 10.0},
+            {'Ticker': 'B.NS', 'roce_num': 20.0, 'earnings_growth_num': 20.0},
+            {'Ticker': 'C.NS', 'roce_num': None, 'earnings_growth_num': None},
+        ])
+        result = compute_growth_quality_quadrant(df).set_index('Ticker')
+        # B is at/above the median of {10, 20} = 15 -> High Returns; also High Growth (20>=15).
+        assert result.loc['B.NS', 'Quadrant'] == QUADRANT_HIGH_GROWTH_HIGH_RETURNS
+        assert result.loc['C.NS', 'Quadrant'] == QUADRANT_INSUFFICIENT_DATA
+
+    def test_missing_columns_entirely_returns_insufficient_data_not_a_crash(self):
+        df = _fundamentals_df([{'Ticker': 'A.NS'}])
+        result = compute_growth_quality_quadrant(df)
+        assert result.iloc[0]['Quadrant'] == QUADRANT_INSUFFICIENT_DATA
+
+    def test_empty_dataframe_returns_empty_with_correct_columns(self):
+        result = compute_growth_quality_quadrant(pd.DataFrame())
+        assert result.empty
+        assert list(result.columns) == ['Ticker', 'roce_num', 'earnings_growth_num', 'Quadrant']
+
+    def test_none_input_does_not_crash(self):
+        result = compute_growth_quality_quadrant(None)
+        assert result.empty
+
+    def test_never_assigns_a_buy_or_conviction_label(self):
+        # The quadrant label itself is the entire output -- no extra scoring/recommendation column.
+        df = _fundamentals_df([{'Ticker': 'A.NS', 'roce_num': 30.0, 'earnings_growth_num': 25.0}])
+        result = compute_growth_quality_quadrant(df)
+        assert set(result.columns) == {'Ticker', 'roce_num', 'earnings_growth_num', 'Quadrant'}
 
 
 class TestMonteCarloWealthProjection:
