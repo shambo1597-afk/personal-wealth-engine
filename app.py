@@ -4,7 +4,6 @@
 # ====================================================================================================
 
 import os
-import io
 import time
 import json
 import datetime
@@ -18,38 +17,38 @@ from scipy.optimize import minimize
 from sklearn.covariance import LedoitWolf
 
 from config import (
-    DB_FILE, RISK_FREE_RATE, MAX_RETAIL_CAP, MAX_SECTOR_CAP, STATUTORY_FEE_BUFFER, MIN_DISPOSAL_VALUE,
-    MIN_ADTV_INR, TOP_N_SELECTED_EQUITIES, BENCHMARK_TICKER,
+    DB_FILE, RISK_FREE_RATE, MAX_RETAIL_CAP, MIN_DISPOSAL_VALUE,
+    TOP_N_SELECTED_EQUITIES,
     EQUITY_DELIVERY_FRICTION, ETF_DEBT_GOLD_FRICTION,
     SOVEREIGN_BOND_TICKER, get_market_time_horizons
 )
 from database import (
     get_db_connection, init_db, clean_tax_lots_df, clean_trade_ledger_df,
     reconcile_corporate_actions_and_splits, parse_and_import_broker_csv, compile_xirr_cash_flows,
-    create_database_backup, backup_database, sync_kite_holdings_to_tax_lots
+    backup_database, sync_kite_holdings_to_tax_lots
 )
 from quant_engine import (
     compute_portfolio_xirr, fetch_master_market_data, solve_portfolio_in_memory,
-    ingest_and_run_dual_pipeline, fetch_latest_prices, fetch_recent_news,
-    fetch_fundamental_scorecard, fetch_live_indian_risk_free_rate, compute_vectorized_monte_carlo_frontier,
-    analyze_ticker_sentiment, compute_news_sentiment_for_universe,
+    fetch_latest_prices, fetch_recent_news,
+    fetch_live_indian_risk_free_rate, compute_vectorized_monte_carlo_frontier,
+    compute_news_sentiment_for_universe,
     compute_lifecycle_asset_allocation,
     sync_structured_fundamentals_for_universe,
-    fetch_structured_company_fundamentals, get_fundamentals_last_synced,
+    get_fundamentals_last_synced,
     get_kite_client, sync_zerodha_live_data,
-    fetch_live_dynamic_multiasset_universe,
     get_asset_sector, get_asset_class,
     compute_sortino_ratio, compute_max_drawdown, compute_calmar_ratio, compute_treynor_ratio,
     compute_historical_var, compute_parametric_var, compute_cvar, MIN_OBSERVATIONS_FOR_RISK_METRICS,
     compute_monte_carlo_wealth_projection,
     run_portfolio_stress_test, STRESS_TEST_SCENARIOS,
+    compute_inverse_herfindahl_index,
 )
 from tax_engine import (
     compute_realized_tax_summary, compute_unrealized_tax_lots_analysis, build_schedule_112a_records,
     recommend_tax_loss_harvesting_trades
 )
 from goals_engine import (
-    GOAL_TYPES, GOAL_TYPE_EMERGENCY_FUND, DEFAULT_EMERGENCY_FUND_MONTHS, DEFAULT_ON_TRACK_TOLERANCE,
+    GOAL_TYPES, GOAL_TYPE_EMERGENCY_FUND, DEFAULT_EMERGENCY_FUND_MONTHS,
     compute_goal_future_value, compute_required_monthly_sip, compute_goal_progress,
     compute_emergency_fund_target,
 )
@@ -2036,6 +2035,32 @@ with tab_risk_lab:
         st.metric("Parametric VaR (95%, 1-Day)", _fmt_pct(param_var_val))
     with rm_col7:
         st.metric("CVaR / Expected Shortfall (95%)", _fmt_pct(cvar_val))
+
+    # Actual current-holdings concentration -- deliberately computed from owned_summary /
+    # latest_prices_series (what you actually hold right now, at today's prices), NOT from
+    # w_optimal_live / target_w_series (the optimizer's proposed weights). The two can diverge
+    # once prices move after purchase, and this is meant to catch drift in the former.
+    actual_holdings_values = {
+        t: owned_summary[t]['total_shares'] * float(latest_prices_series.get(t, 0.0))
+        for t in owned_summary
+        if owned_summary[t]['total_shares'] > 0 and float(latest_prices_series.get(t, 0.0)) > 0
+    }
+    actual_holding_count = len(actual_holdings_values)
+    inv_hhi_val = compute_inverse_herfindahl_index(actual_holdings_values)
+
+    dc_col1, dc_col2 = st.columns(2)
+    with dc_col1:
+        st.metric("Positions Held (Actual)", f"{actual_holding_count}")
+    with dc_col2:
+        if inv_hhi_val is not None:
+            st.metric("Effective Diversification", f"~{inv_hhi_val:.1f} stocks", f"Inverse HHI = {inv_hhi_val:.2f}")
+        else:
+            st.metric("Effective Diversification", "N/A", "No current holdings")
+    st.caption(
+        "Effective diversification is computed from your ACTUAL current holdings at live prices "
+        "(not the optimizer's target weights) -- the gap between it and 'Positions Held' shows "
+        "how much of your nominal position count is really just concentration in a few names."
+    )
 
     st.markdown("---")
 

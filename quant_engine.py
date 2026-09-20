@@ -5,15 +5,10 @@
 
 import os
 import io
-import ssl
-import json
-import time
 import hashlib
 import logging
 import datetime
 import concurrent.futures
-import urllib.request
-import urllib.error
 import re
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -33,7 +28,7 @@ from scipy.cluster.hierarchy import linkage, to_tree
 from scipy.spatial.distance import squareform
 
 from config import (
-    RISK_FREE_RATE, MAX_RETAIL_CAP, MAX_SECTOR_CAP, STATUTORY_FEE_BUFFER,
+    RISK_FREE_RATE, MAX_RETAIL_CAP, MAX_SECTOR_CAP,
     MIN_ADTV_INR, TOP_N_SELECTED_EQUITIES,
     BENCHMARK_TICKER, SOVEREIGN_BOND_TICKER,
     get_market_time_horizons
@@ -435,16 +430,6 @@ def fetch_live_dynamic_multiasset_universe(
 
     return candidate_tickers, dynamic_sector_map, dynamic_class_map
 
-@st.cache_data(ttl=604800, show_spinner=False)
-def fetch_live_nifty_universe(
-    index_code: str = 'nifty500', turbo_mode: bool = False
-) -> Tuple[List[str], Dict[str, str], bool]:
-    """
-    Backwards-compatible wrapper delegating to fetch_live_dynamic_multiasset_universe().
-    """
-    tickers, sec_map, _ = fetch_live_dynamic_multiasset_universe(turbo_mode=turbo_mode)
-    return tickers, sec_map, True
-
 # ----------------------------------------------------------------------------------------------------
 # 1. HIERARCHICAL RISK PARITY (HRP) & WEIGHT PROJECTION
 # ----------------------------------------------------------------------------------------------------
@@ -580,12 +565,14 @@ def project_weights_sector_capped(
     sector_map: Optional[Dict[str, str]] = None,
 ) -> np.ndarray:
     """
-    SECTOR CONCENTRATION ENVELOPE (25% CAP) & ASSET CONVICTION CAP (20% CAP):
+    SECTOR CONCENTRATION ENVELOPE (20% CAP) & ASSET CONVICTION CAP (20% CAP):
     Executes constrained quadratic projection onto the probability simplex with:
       1. Individual Asset Cap: w_i <= max_asset_cap (20.0%)
-      2. Aggregate Sector Cap: sum_{i in Sector k} w_i <= max_sector_cap (25.0%)
+      2. Aggregate Sector Cap: sum_{i in Sector k} w_i <= max_sector_cap (20.0%)
       3. Budget conservation: sum(w_i) == 1.0
-    Guarantees no sector breaches 25% while minimizing tracking distortion.
+    Guarantees no sector breaches 20% while minimizing tracking distortion (unless strictly
+    infeasible given the number of sectors present, in which case the cap is relaxed to the
+    minimum needed to keep the projection feasible -- see sec_caps below).
     """
     if sector_map is None:
         sector_map = {}
@@ -774,7 +761,7 @@ def solve_portfolio_in_memory(
     """
     Tier 2: Pure mathematical optimization engine for Markowitz Max-Sharpe, MVP, and HRP allocations.
     Embeds sector concentration constraints directly into SLSQP line search, applies Ledoit-Wolf shrinkage,
-    and guarantees 20% single-asset cap and 25% sector cap.
+    and guarantees 20% single-asset cap and 20% sector cap.
     """
     # No eligible candidates to optimize over (e.g. the fundamentals store hasn't been synced
     # yet, so every ticker is buy-blocked) -- return a well-defined empty portfolio instead of
@@ -943,13 +930,6 @@ def solve_portfolio_in_memory(
         'active_mean_vector': active_mean_vector,
         'optimal_k': len(selected_tickers)
     }
-
-def run_markowitz_optimization(
-    candidate_returns: pd.DataFrame, mode: str = 'Max-Sharpe (Ledoit-Wolf)', rf_rate: Optional[float] = None
-) -> Dict[str, Any]:
-    """Backwards-compatible alias for solve_portfolio_in_memory."""
-    rf = rf_rate if rf_rate is not None else RISK_FREE_RATE
-    return solve_portfolio_in_memory(candidate_returns, mode=mode, risk_free_rate=rf, max_retail_cap=MAX_RETAIL_CAP)
 
 # ----------------------------------------------------------------------------------------------------
 # 3. DUPONT 3-STAGE ROE & MULTI-FACTOR RANKING ENGINE & LOCAL PERSISTENT FUNDAMENTALS STORE
@@ -1711,37 +1691,12 @@ def compute_multifactor_rankings(
     else:
         vols_aligned = volume_history_df.reindex(index=sub_prices.index, columns=valid_cols).fillna(0.0)
 
-    accum_ratio_series = pd.Series(index=valid_cols, dtype=float)
-    accum_badge_series = pd.Series(index=valid_cols, dtype=object)
-
-    for col in valid_cols:
-        v_s = vols_aligned[col].dropna() if col in vols_aligned.columns else pd.Series(dtype=float)
-        # Filter out zero / non-positive volume bars for robust statistics
-        v_pos = v_s[v_s > 0]
-        if len(v_pos) >= 5:
-            mean_5d = float(v_pos.tail(5).mean())
-            med_90d = float(v_pos.tail(90).median()) if len(v_pos) >= 10 else float(v_pos.median())
-            if med_90d > 0 and np.isfinite(med_90d):
-                ratio_val = float(np.round(mean_5d / med_90d, 2))
-            else:
-                ratio_val = 1.0
-        else:
-            ratio_val = 1.0
-
-        accum_ratio_series[col] = ratio_val
-
-        # Badge assignment:
-        # If Accumulation_Ratio >= 2.0: "🔥 Heavy Institutional Accumulation (≥2x Volume)"
-        # If Accumulation_Ratio >= 1.3: "🟢 Steady Inflows"
-        # Otherwise: "⚪ Neutral Flow"
-        if ratio_val >= 2.0:
-            badge = "🔥 Heavy Institutional Accumulation (≥2x Volume)"
-        elif ratio_val >= 1.3:
-            badge = "🟢 Steady Inflows"
-        else:
-            badge = "⚪ Neutral Flow"
-
-        accum_badge_series[col] = badge
+    # Delegates to compute_institutional_accumulation_factor (Section 4) rather than
+    # re-deriving Mean(5D)/Median(90D) inline, so there is exactly one implementation of this
+    # calculation to keep in sync.
+    accum_ratio_series, accum_badge_series = compute_institutional_accumulation_factor(vols_aligned)
+    accum_ratio_series = accum_ratio_series.reindex(valid_cols)
+    accum_badge_series = accum_badge_series.reindex(valid_cols)
 
     # 5. Align fundamentals & 9-point Piotroski F-Score
     fund_map = fundamentals_df.set_index('Ticker') if not fundamentals_df.empty else pd.DataFrame()
@@ -2727,10 +2682,6 @@ def fetch_master_market_data(
         'data_integrity_report': data_integrity_report
     }
 
-def fetch_cached_market_data(turbo_mode: bool = False) -> Dict[str, Any]:
-    """Alias for fetch_master_market_data."""
-    return fetch_master_market_data(turbo_mode=turbo_mode)
-
 @st.cache_data(show_spinner=False)
 def compute_vectorized_monte_carlo_frontier(
     active_cov_matrix: np.ndarray,
@@ -3160,6 +3111,38 @@ def compute_cvar(returns: pd.Series, confidence: float = 0.95) -> Optional[float
     if len(tail_losses) == 0:
         return hist_var
     return float(max(0.0, -float(tail_losses.mean())))
+
+
+def compute_inverse_herfindahl_index(weights: Union[Dict[str, float], pd.Series]) -> Optional[float]:
+    """
+    Inverse Herfindahl-Hirschman Index (Inverse HHI), a.k.a. the "effective number of stocks":
+        HHI = sum(w_i^2),   Inverse HHI = 1 / HHI
+    `weights` need not already sum to exactly 1.0 -- they are normalized first (each divided by
+    the sum of all values) so the result is still meaningful if the caller passes raw position
+    values (e.g. rupee amounts) rather than pre-normalized weights.
+    Interpretation: a portfolio of N equally-weighted positions scores exactly N (its nominal
+    count). The same N positions concentrated unevenly (e.g. one at 40%, the rest splitting the
+    remainder) scores well below N, reflecting the real diversification lost to concentration --
+    this is what makes it a useful companion to a bare position count.
+    Returns None for empty input, all-zero weights, or a negative sum (nothing meaningful to
+    normalize against) rather than dividing by zero.
+    """
+    if weights is None:
+        return None
+    w = pd.Series(weights, dtype=float) if not isinstance(weights, pd.Series) else weights.astype(float)
+    w = w.dropna()
+    if w.empty:
+        return None
+
+    total = float(w.sum())
+    if total <= 1e-12:
+        return None
+
+    normalized = w / total
+    hhi = float(np.sum(normalized.values ** 2))
+    if hhi <= 1e-12:
+        return None
+    return float(1.0 / hhi)
 
 # ----------------------------------------------------------------------------------------------------
 # 9. FORWARD-LOOKING MONTE CARLO WEALTH PROJECTION ENGINE

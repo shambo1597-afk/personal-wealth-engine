@@ -21,7 +21,7 @@ except (ValueError, TypeError):
     RISK_FREE_RATE          = 0.065
 
 MAX_RETAIL_CAP              = 0.20           # 20.0% Single-Asset Conviction Cap
-MAX_SECTOR_CAP              = 0.25           # 25.0% Maximum Sector Concentration Cap
+MAX_SECTOR_CAP              = 0.20           # 20.0% Maximum Sector Concentration Cap
 MIN_DISPOSAL_VALUE          = 3000.0         # ₹3,000 DP Fee Shield Floor for Trims
 MIN_ADTV_INR                = 100_000_000.0  # ₹10.0 Crore (100M INR) 90-Day Median ADTV Liquidity Gate
 TOP_N_SELECTED_EQUITIES     = 20             # Top 20 Factor-Ranked Equities Fed to Optimizer

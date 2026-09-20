@@ -44,6 +44,8 @@ from quant_engine import (
     STRESS_TEST_MARKET_CRASH_EQUITY_SHOCK,
     STRESS_TEST_INFLATION_SURGE_DELTA,
     run_portfolio_stress_test,
+    compute_institutional_accumulation_factor,
+    compute_inverse_herfindahl_index,
 )
 
 
@@ -127,12 +129,13 @@ class TestSectorCappedSimplexProjection:
         assert np.all(w >= -1e-9)
 
     def test_sector_cap_enforced_with_sufficient_sector_diversity(self):
-        # 4 sectors of 5 assets each: 25% cap per sector is feasible (4 * 25% = 100%).
+        # 5 sectors of 4 assets each: 20% cap per sector is exactly feasible (5 * 20% = 100%),
+        # so the projector must enforce the nominal cap here rather than relaxing it.
         tickers = [f"A{i}" for i in range(20)]
-        sectors = ["FIN", "IT", "PHARMA", "AUTO"]
-        sector_map = {t: sectors[i // 5] for i, t in enumerate(tickers)}
+        sectors = ["FIN", "IT", "PHARMA", "AUTO", "ENERGY"]
+        sector_map = {t: sectors[i // 4] for i, t in enumerate(tickers)}
         # Concentrate almost everything into the FIN sector to force the projector to act.
-        weights = [0.2] * 5 + [0.0] * 15
+        weights = [0.25] * 4 + [0.0] * 16
         w = self._run(weights, tickers, sector_map)
         sector_sums: Dict[str, float] = defaultdict(float)
         for t, wi in zip(tickers, w):
@@ -140,10 +143,10 @@ class TestSectorCappedSimplexProjection:
         assert w.sum() == pytest.approx(1.0, abs=1e-6)
         assert w.max() <= MAX_RETAIL_CAP + 1e-6
         for s, total in sector_sums.items():
-            assert total <= MAX_SECTOR_CAP + 1e-4, f"Sector {s} breached the 25% cap: {total}"
+            assert total <= MAX_SECTOR_CAP + 1e-4, f"Sector {s} breached the {MAX_SECTOR_CAP*100:.0f}% cap: {total}"
 
     def test_gracefully_relaxes_only_when_strictly_infeasible(self):
-        # Only 2 sectors present: 25% + 25% = 50% < 100% budget, so a strict 25% cap on
+        # Only 2 sectors present: 20% + 20% = 40% < 100% budget, so a strict 20% cap on
         # both is mathematically infeasible. The projector must still return a valid
         # simplex (sum=1, long-only, asset cap respected) rather than raising or failing.
         tickers = [f"A{i}" for i in range(10)]
@@ -857,6 +860,33 @@ class TestMultifactorRankingsFundamentalsGating:
         assert by_ticker.loc['HDFCBANK.NS', 'Data_Available'] == True
         assert by_ticker.loc['HDFCBANK.NS', 'F_Score_Safe'] == True
 
+    def test_accumulation_output_matches_compute_institutional_accumulation_factor_directly(self):
+        # Regression guard for a real de-duplication: compute_multifactor_rankings used to
+        # hand-reimplement compute_institutional_accumulation_factor's Mean(5D)/Median(90D)
+        # logic inline instead of calling it, so the two copies could silently drift apart.
+        # This pins the scorecard's Accumulation_Ratio / Institutional_Inflow_Badge columns to
+        # match compute_institutional_accumulation_factor's own output on the identical volume
+        # data, so a future edit to one without the other breaks this test immediately.
+        tickers = ['TCS.NS', 'HDFCBANK.NS', 'INFY.NS']
+        price_hist, vol_hist, adtv_series = self._price_and_volume(tickers)
+        fundamentals_df = pd.DataFrame([
+            {'Ticker': t, 'Asset': t.replace('.NS', ''), 'Data Source': 'EODHD REST API (Audited)',
+             'roe_num': 20.0, 'de_num': 0.3, 'npm_num': 15.0, 'pe_num': 22.0,
+             'piotroski_f_score': 7, 'piotroski_badge': '🟢 Strong (8-9/9)',
+             'Piotroski F-Score': '7/9', 'Fundamental Health': '✅ High Quality (Audited)'}
+            for t in tickers
+        ])
+        by_ticker = compute_multifactor_rankings(
+            price_hist, tickers, fundamentals_df,
+            volume_history_df=vol_hist, adtv_series=adtv_series,
+        ).set_index('Ticker')
+
+        expected_ratios, expected_badges = compute_institutional_accumulation_factor(vol_hist)
+
+        for t in tickers:
+            assert by_ticker.loc[t, 'Accumulation_Ratio'] == pytest.approx(expected_ratios[t])
+            assert by_ticker.loc[t, 'Institutional_Inflow_Badge'] == expected_badges[t]
+
     def test_eodhd_sync_exempts_financial_institutions_from_fscore_gate(self, monkeypatch):
         # fetch_structured_company_fundamentals itself (not just the scorecard gate) must label
         # a bank's real audited REST data as exempt, since a numeric Piotroski F-Score computed
@@ -1112,6 +1142,45 @@ class TestValueAtRiskAndCVaR:
         r = _synthetic_returns(n=200, seed=10)
         quant_engine.compute_cvar(r, confidence=0.9)
         assert 0.9 in calls
+
+
+class TestInverseHerfindahlIndex:
+    def test_n_equal_weights_returns_exactly_n(self):
+        for n in [1, 5, 20, 50]:
+            weights = {f'T{i}': 1.0 / n for i in range(n)}
+            assert compute_inverse_herfindahl_index(weights) == pytest.approx(float(n))
+
+    def test_single_full_weight_returns_exactly_one(self):
+        assert compute_inverse_herfindahl_index({'ONLY.NS': 1.0}) == pytest.approx(1.0)
+
+    def test_empty_input_returns_none(self):
+        assert compute_inverse_herfindahl_index({}) is None
+        assert compute_inverse_herfindahl_index(pd.Series(dtype=float)) is None
+
+    def test_zero_sum_weights_returns_none_instead_of_dividing_by_zero(self):
+        assert compute_inverse_herfindahl_index({'A': 0.0, 'B': 0.0}) is None
+
+    def test_concentration_scores_well_below_nominal_count(self):
+        # 20 nominal positions, but one holds 40% and the rest split the remainder evenly --
+        # the effective count must be well below 20, not just marginally lower.
+        weights = {'BIG.NS': 0.40}
+        weights.update({f'S{i}.NS': 0.60 / 19 for i in range(19)})
+        eff_n = compute_inverse_herfindahl_index(weights)
+        assert eff_n < 10.0
+        assert eff_n < 20.0
+
+    def test_raw_unnormalized_position_values_are_normalized_first(self):
+        # Rupee position values, not pre-normalized weights -- three equal-value positions
+        # must still score 3, exactly as if they'd been passed as 1/3 weights.
+        eff_n = compute_inverse_herfindahl_index({'A': 400000.0, 'B': 400000.0, 'C': 400000.0})
+        assert eff_n == pytest.approx(3.0)
+
+    def test_accepts_both_dict_and_series_input(self):
+        weights_dict = {'A': 0.5, 'B': 0.3, 'C': 0.2}
+        weights_series = pd.Series(weights_dict)
+        assert compute_inverse_herfindahl_index(weights_dict) == pytest.approx(
+            compute_inverse_herfindahl_index(weights_series)
+        )
 
 
 class TestMonteCarloWealthProjection:
