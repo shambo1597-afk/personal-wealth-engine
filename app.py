@@ -172,6 +172,7 @@ with st.sidebar.form("engine_settings_form"):
         help="Bypasses all live network checks and executes purely in-memory from local Parquet data (<0.05s)."
     )
 
+    st.caption(f"💰 Recalculating with **₹{total_available_broker_cash:,.2f}** available cash")
     recalculate_btn = st.form_submit_button("⚡ Run & Recalculate Portfolio", type="primary")
 
 live_rf_val, is_live, source_name = fetch_live_indian_risk_free_rate(turbo_mode=turbo_mode)
@@ -276,6 +277,7 @@ if st.sidebar.button("🔄 Clear Market Cache & Recalculate"):
 # 3. MAIN DASHBOARD EXECUTION & TWO-TIER QUANT PIPELINE
 # ----------------------------------------------------------------------------------------------------
 st.title("🏛️ Master Quantitative Wealth Operating System")
+st.caption(f"💰 Recalculating with **₹{total_available_broker_cash:,.2f}** available broker wallet cash")
 
 progress_placeholder = st.empty()
 with progress_placeholder.container():
@@ -837,28 +839,33 @@ total_residual_cash  = unspent_bond_cash
 # ----------------------------------------------------------------------------------------------------
 # 5. SUMMARY KPIS & TOP METRIC CARDS
 # ----------------------------------------------------------------------------------------------------
-kpi_row1_col1, kpi_row1_col2, kpi_row1_col3, kpi_row1_col4, kpi_row1_col5 = st.columns(5)
+# Three-then-two (not one row of 5) -- five equal columns don't leave enough width for a
+# ₹-formatted 7-figure value (e.g. "₹2,683,450.75") to render without CSS ellipsis-truncating
+# it, even though the labels themselves are short enough to fit.
+kpi_row1_col1, kpi_row1_col2, kpi_row1_col3 = st.columns(3)
 with kpi_row1_col1:
-    st.metric("Total Net Worth", f"₹{total_portfolio_wealth:,.2f}")
+    st.metric("Net Worth", f"₹{total_portfolio_wealth:,.2f}")
 with kpi_row1_col2:
-    st.metric("Total Capital Invested", f"₹{total_invested_capital:,.2f}")
+    st.metric("Capital Invested", f"₹{total_invested_capital:,.2f}")
 with kpi_row1_col3:
     st.metric("Unrealized P/L", f"₹{unrealized_pl:,.2f}", f"{unrealized_pl_pct:+.2f}%")
-with kpi_row1_col4:
-    st.metric("Personal Money-Weighted IRR (XIRR)", xirr_display, "Annualized Compounded" if pd.notna(xirr_value) else None)
-with kpi_row1_col5:
+
+kpi_row1b_col1, kpi_row1b_col2 = st.columns(2)
+with kpi_row1b_col1:
+    st.metric("Portfolio XIRR", xirr_display, "Money-Weighted" if pd.notna(xirr_value) else None)
+with kpi_row1b_col2:
     alloc_delta = f"Age {exact_age:.0f} (T={years_to_goal:.1f}Y) | {'🛡️ LDI Shield' if years_to_goal <= 3.0 else regime_tag}"
-    st.metric("Target Allocation", f"{w_risky*100:.0f}% Eq / {w_safe*100:.0f}% Bond", alloc_delta)
+    st.metric("Target Allocation", f"{w_risky*100:.0f}/{w_safe*100:.0f} Eq/Debt", alloc_delta)
 
 kpi_row2_col1, kpi_row2_col2, kpi_row2_col3, kpi_row2_col4 = st.columns(4)
 with kpi_row2_col1:
-    st.metric("Fresh Cash Deployed", f"₹{actual_spent_on_buys:,.2f}", f"{(actual_spent_on_buys/total_available_broker_cash)*100:.1f}%" if total_available_broker_cash > 0 else "0.0%")
+    st.metric("Cash Deployed", f"₹{actual_spent_on_buys:,.2f}", f"{(actual_spent_on_buys/total_available_broker_cash)*100:.1f}%" if total_available_broker_cash > 0 else "0.0%")
 with kpi_row2_col2:
-    st.metric("Est. Statutory Fees (STT)", f"₹{estimated_fees:,.2f}", "Exchange Friction")
+    st.metric("Est. STT & Fees", f"₹{estimated_fees:,.2f}", "Exchange Friction")
 with kpi_row2_col3:
     st.metric("Capital Harvested", f"₹{harvested_from_sells:,.2f}")
 with kpi_row2_col4:
-    st.metric("Residual Wallet Cash", f"₹{total_residual_cash:,.2f}")
+    st.metric("Residual Cash", f"₹{total_residual_cash:,.2f}")
 
 # ----------------------------------------------------------------------------------------------------
 # 6. ACID TRANSACTION COMMIT WITH PRE-COMMIT SAFETY GUARD & AUDIT LEDGER
@@ -895,11 +902,11 @@ with st.expander("🛡️ Pre-Commit Execution Summary & Confirmation Safety Gua
     
     sum_col1, sum_col2, sum_col3, sum_col4 = st.columns(4)
     with sum_col1:
-        st.metric("🟢 Total Buy Orders", f"{total_buys_count} Order(s)", f"₹{total_inr_to_deploy:,.2f} to Deploy")
+        st.metric("🟢 Buy Orders", f"{total_buys_count} Order(s)", f"₹{total_inr_to_deploy:,.2f} to Deploy")
     with sum_col2:
-        st.metric("🔴 Total Sell Orders", f"{total_sells_count} Order(s)", f"₹{capital_harvested_val:,.2f} Harvested")
+        st.metric("🔴 Sell Orders", f"{total_sells_count} Order(s)", f"₹{capital_harvested_val:,.2f} Harvested")
     with sum_col3:
-        st.metric("⚡ Est. STT & Friction", f"₹{estimated_friction_val:,.2f}", "Brokerage & Statutory")
+        st.metric("⚡ STT & Friction", f"₹{estimated_friction_val:,.2f}", "Brokerage & Statutory")
     with sum_col4:
         st.metric("💵 Remaining Cash", f"₹{remaining_unallocated_cash:,.2f}", "Unallocated Wallet Cash")
 
@@ -1797,33 +1804,38 @@ with tab_dupont:
             st.caption(f"📌 **Fundamentals Source:** `{data_source_val}` | Audited Annual Filings (Balance Sheet, P&L, Cash Flow)")
             st.latex(r"\text{DuPont ROE} = \underbrace{\left(\frac{\text{Net Income}}{\text{Revenue}}\right)}_{\text{Net Profit Margin}} \times \underbrace{\left(\frac{\text{Revenue}}{\text{Total Assets}}\right)}_{\text{Asset Turnover}} \times \underbrace{\left(\frac{\text{Total Assets}}{\text{Total Equity}}\right)}_{\text{Financial Leverage}}")
 
-            d_c1, d_c2, d_c3, d_c4, d_c5, d_c6 = st.columns(6)
+            # Two rows of 3 (not one row of 6) -- six equal columns left too little width per
+            # metric for the label to render without CSS ellipsis-truncating it, even after
+            # shortening the label text itself.
+            d_c1, d_c2, d_c3 = st.columns(3)
             with d_c1:
                 st.metric(
-                    "1. Net Margin (%)",
+                    "1. Net Margin",
                     f"{npm_val:.1f}%" if npm_val is not None else "N/A",
                     help="Operating Efficiency: Percentage of revenue converted into bottom-line net profit."
                 )
                 st.caption("*(Operating Efficiency)*")
             with d_c2:
                 st.metric(
-                    "2. Asset Turnover (x)",
+                    "2. Asset Turnover",
                     f"{turnover_val:.2f}x" if turnover_val is not None else "N/A",
                     help="Asset Utilization: Revenue generated per unit of total assets deployed."
                 )
                 st.caption("*(Asset Utilization)*")
             with d_c3:
                 st.metric(
-                    "3. Financial Leverage",
+                    "3. Fin. Leverage",
                     f"{leverage_val:.2f}x" if leverage_val is not None else "N/A",
                     f"D/E: {de_val:.2f}x" if de_val is not None else "D/E: N/A",
                     delta_color="off",
                     help="Capital Structure: Total assets divided by shareholders' equity."
                 )
                 st.caption("*(Solvency / Leverage)*")
+
+            d_c4, d_c5, d_c6 = st.columns(3)
             with d_c4:
                 st.metric(
-                    "= 3-Stage DuPont ROE",
+                    "= DuPont ROE",
                     f"{roe_val:.1f}%" if roe_val is not None else "N/A",
                     f"Health: {health_val}",
                     delta_color="normal" if (roe_val is not None and roe_val > 15.0) else "inverse",
@@ -1841,7 +1853,7 @@ with tab_dupont:
                 st.caption("*(Balance Sheet Health)*")
             with d_c6:
                 st.metric(
-                    "Institutional Inflow",
+                    "Inst. Inflow",
                     f"{accum_ratio_val:.2f}x",
                     inflow_badge_val,
                     delta_color="normal" if accum_ratio_val >= 1.3 else "off",
@@ -1958,10 +1970,22 @@ with tab_dupont:
             QUADRANT_INSUFFICIENT_DATA,
         ]
         quadrant_counts = quadrant_df['Quadrant'].value_counts()
+        # Full quadrant names (e.g. "High Growth + High Returns") don't fit as a 1-of-5 metric
+        # label without truncating -- abbreviate here for display only (the underlying
+        # QUADRANT_* constants used for filtering/tests are untouched) and spell the
+        # abbreviations out once in the caption below rather than per metric.
+        quad_short_labels = {
+            QUADRANT_HIGH_GROWTH_HIGH_RETURNS: "HG + HR",
+            QUADRANT_HIGH_GROWTH_LOW_RETURNS: "HG + LR",
+            QUADRANT_LOW_GROWTH_HIGH_RETURNS: "LG + HR",
+            QUADRANT_LOW_GROWTH_LOW_RETURNS: "LG + LR",
+            QUADRANT_INSUFFICIENT_DATA: "No Data",
+        }
         quad_cols = st.columns(5)
         for quad_col, quad_label in zip(quad_cols, quad_order):
             with quad_col:
-                st.metric(quad_label, int(quadrant_counts.get(quad_label, 0)))
+                st.metric(quad_short_labels[quad_label], int(quadrant_counts.get(quad_label, 0)))
+        st.caption("HG/LG = High/Low Growth, HR/LR = High/Low Returns (ROCE). See the quadrant filter below for full names.")
 
         quadrant_filter = st.selectbox(
             "Filter to quadrant:",
@@ -2021,35 +2045,42 @@ with tab_harvest:
     unrealized_tax_analysis = compute_unrealized_tax_lots_analysis(tax_lots_df, latest_prices_series)
     harvest_recommendations_df = recommend_tax_loss_harvesting_trades(tax_summary, unrealized_tax_analysis)
 
-    # 5 KPI Metric Summary Cards
-    cg_col1, cg_col2, cg_col3, cg_col4, cg_col5 = st.columns(5)
+    # 3-then-2 (not one row of 5) -- the FY qualifier moved out of each label (it was pushing
+    # labels like "Net Sec 112A LTCG (FY 2026-27)" well past what a 1-of-5 column can render
+    # without truncating) and into one shared caption above the row instead. Five equal columns
+    # also left too little width for the ₹-formatted values and their delta text (e.g.
+    # "STCL: ₹15,000 | LTCL: ₹13,900") to render without truncating, even with short labels.
+    st.caption(f"All realized figures below are for **{current_fy_str}** unless noted.")
+    cg_col1, cg_col2, cg_col3 = st.columns(3)
     with cg_col1:
         st.metric(
-            f"Net Sec 112A LTCG ({current_fy_str})",
+            "Sec 112A LTCG",
             f"₹{tax_summary['post_setoff_ltcg']:,.2f}",
             f"Tax @ 12.5%: ₹{tax_summary['tax_payable_112a']:,.2f}" if tax_summary['post_setoff_ltcg'] > 125000 else "100% Tax-Free (≤ ₹1.25L)"
         )
     with cg_col2:
         st.metric(
-            f"Net Sec 111A STCG ({current_fy_str})",
+            "Sec 111A STCG",
             f"₹{tax_summary['post_setoff_stcg']:,.2f}",
             f"Tax @ 20.0%: ₹{tax_summary['tax_payable_111a']:,.2f}" if tax_summary['post_setoff_stcg'] > 0 else "No STCG Tax Liability"
         )
     with cg_col3:
         st.metric(
-            f"Sec 50AA Debt STCG ({current_fy_str})",
+            "Sec 50AA STCG",
             f"₹{tax_summary['net_50aa_stcg']:,.2f}",
             "Taxable @ Slab Rates"
         )
-    with cg_col4:
+
+    cg2_col1, cg2_col2 = st.columns(2)
+    with cg2_col1:
         st.metric(
-            "Net Realized Loss (Sec 70/74)",
+            "Realized Loss (70/74)",
             f"₹{tax_summary['total_realized_loss_for_setoff']:,.2f}",
             f"STCL: ₹{tax_summary['unabsorbed_stcl']:,.0f} | LTCL: ₹{tax_summary['unabsorbed_ltcl']:,.0f}"
         )
-    with cg_col5:
+    with cg2_col2:
         st.metric(
-            "Unrealized Loss Harvestable",
+            "Harvestable Loss",
             f"₹{unrealized_tax_analysis['total_harvestable_losses']:,.2f}",
             f"{len(unrealized_tax_analysis['loss_rows'])} Active Position(s)"
         )
@@ -2143,11 +2174,12 @@ with tab_risk_lab:
 
     rm_col5, rm_col6, rm_col7 = st.columns(3)
     with rm_col5:
-        st.metric("Historical VaR (95%, 1-Day)", _fmt_pct(hist_var_val))
+        st.metric("Historical VaR (95%)", _fmt_pct(hist_var_val))
     with rm_col6:
-        st.metric("Parametric VaR (95%, 1-Day)", _fmt_pct(param_var_val))
+        st.metric("Parametric VaR (95%)", _fmt_pct(param_var_val))
     with rm_col7:
-        st.metric("CVaR / Expected Shortfall (95%)", _fmt_pct(cvar_val))
+        st.metric("CVaR (95%)", _fmt_pct(cvar_val))
+    st.caption("VaR/CVaR are 1-day horizon; CVaR (Conditional VaR) = Expected Shortfall.")
 
     # Actual current-holdings concentration -- deliberately computed from owned_summary /
     # latest_prices_series (what you actually hold right now, at today's prices), NOT from
@@ -2174,24 +2206,25 @@ with tab_risk_lab:
     inv_hhi_core_val = compute_inverse_herfindahl_index(core_holdings_values)
     inv_hhi_satellite_val = compute_inverse_herfindahl_index(satellite_holdings_values)
 
+    st.markdown("###### Effective Diversification (Inverse HHI -- \"effective number of stocks\")")
     dc_col1, dc_col2, dc_col3, dc_col4 = st.columns(4)
     with dc_col1:
-        st.metric("Positions Held (Actual)", f"{actual_holding_count}")
+        st.metric("Positions Held", f"{actual_holding_count}")
     with dc_col2:
         if inv_hhi_val is not None:
-            st.metric("Effective Diversification (Whole)", f"~{inv_hhi_val:.1f} stocks", f"Inverse HHI = {inv_hhi_val:.2f}")
+            st.metric("Whole Portfolio", f"~{inv_hhi_val:.1f} stocks", f"Inverse HHI = {inv_hhi_val:.2f}")
         else:
-            st.metric("Effective Diversification (Whole)", "N/A", "No current holdings")
+            st.metric("Whole Portfolio", "N/A", "No current holdings")
     with dc_col3:
         if inv_hhi_core_val is not None:
-            st.metric("Effective Diversification (Core)", f"~{inv_hhi_core_val:.1f} stocks", f"Inverse HHI = {inv_hhi_core_val:.2f}")
+            st.metric("Core Only", f"~{inv_hhi_core_val:.1f} stocks", f"Inverse HHI = {inv_hhi_core_val:.2f}")
         else:
-            st.metric("Effective Diversification (Core)", "N/A", "No core holdings")
+            st.metric("Core Only", "N/A", "No core holdings")
     with dc_col4:
         if inv_hhi_satellite_val is not None:
-            st.metric("Effective Diversification (Satellite)", f"~{inv_hhi_satellite_val:.1f} stocks", f"Inverse HHI = {inv_hhi_satellite_val:.2f}")
+            st.metric("Satellite Only", f"~{inv_hhi_satellite_val:.1f} stocks", f"Inverse HHI = {inv_hhi_satellite_val:.2f}")
         else:
-            st.metric("Effective Diversification (Satellite)", "N/A", "No satellite holdings")
+            st.metric("Satellite Only", "N/A", "No satellite holdings")
     st.caption(
         "Effective diversification is computed from your ACTUAL current holdings at live prices "
         "(not the optimizer's target weights) -- the gap between it and 'Positions Held' shows "
