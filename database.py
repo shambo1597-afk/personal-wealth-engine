@@ -16,9 +16,9 @@ import numpy as np
 import yfinance as yf
 
 from config import (
-    DB_FILE, STATUTORY_FEE_BUFFER, SOVEREIGN_BOND_TICKER,
+    DB_FILE, SOVEREIGN_BOND_TICKER,
     EQUITY_DELIVERY_FRICTION, ETF_DEBT_GOLD_FRICTION, DP_CHARGE_FLAT_INR,
-    get_market_time_horizons, TODAY, TODAY_STR, TODAY_ISO
+    get_market_time_horizons
 )
 
 # A print() to stdout is invisible in a Streamlit app launched by double-clicking run_app.bat on
