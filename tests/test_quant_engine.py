@@ -47,6 +47,7 @@ from quant_engine import (
     compute_institutional_accumulation_factor,
     compute_inverse_herfindahl_index,
     compute_core_satellite_split,
+    compute_sector_composition,
     compute_growth_quality_quadrant,
     QUADRANT_HIGH_GROWTH_HIGH_RETURNS,
     QUADRANT_HIGH_GROWTH_LOW_RETURNS,
@@ -1338,6 +1339,71 @@ class TestCoreSatelliteSplit:
         result = compute_core_satellite_split({'A': 100000.0}, {'A': 'growth'})
         assert result['core_count'] == 1
         assert result['satellite_count'] == 0
+
+
+class TestSectorComposition:
+    def test_groups_by_sector_with_correct_value_and_pct(self):
+        result = compute_sector_composition(
+            {'TCS.NS': 500000.0, 'INFY.NS': 300000.0, 'HDFCBANK.NS': 200000.0},
+            {'TCS.NS': 'Information Technology', 'INFY.NS': 'Information Technology', 'HDFCBANK.NS': 'Financials'},
+        )
+        it_row = result[result['Sector'] == 'Information Technology'].iloc[0]
+        fin_row = result[result['Sector'] == 'Financials'].iloc[0]
+        assert it_row['Value'] == pytest.approx(800000.0)
+        assert it_row['Position_Count'] == 2
+        # Pct is on a 0.0-1.0 scale, matching compute_core_satellite_split's core_pct/
+        # satellite_pct convention -- not 0-100.
+        assert it_row['Pct'] == pytest.approx(0.8)
+        assert fin_row['Value'] == pytest.approx(200000.0)
+        assert fin_row['Pct'] == pytest.approx(0.2)
+
+    def test_sorted_by_value_descending(self):
+        result = compute_sector_composition(
+            {'A': 100000.0, 'B': 500000.0, 'C': 300000.0},
+            {'A': 'Energy & Utilities', 'B': 'Financials', 'C': 'Information Technology'},
+        )
+        assert list(result['Sector']) == ['Financials', 'Information Technology', 'Energy & Utilities']
+
+    def test_untagged_ticker_falls_back_to_other_not_dropped(self):
+        result = compute_sector_composition(
+            {'TCS.NS': 100000.0, 'MYSTERY.NS': 50000.0},
+            {'TCS.NS': 'Information Technology'},  # MYSTERY.NS has no entry
+        )
+        assert 'Other' in result['Sector'].values
+        other_row = result[result['Sector'] == 'Other'].iloc[0]
+        assert other_row['Value'] == pytest.approx(50000.0)
+        assert other_row['Position_Count'] == 1
+
+    def test_empty_holdings_returns_empty_dataframe_with_correct_columns(self):
+        result = compute_sector_composition({}, {})
+        assert result.empty
+        assert list(result.columns) == ['Sector', 'Value', 'Pct', 'Position_Count']
+
+    def test_zero_or_negative_values_excluded_not_a_crash(self):
+        result = compute_sector_composition(
+            {'A': 0.0, 'B': -100.0, 'C': 50000.0},
+            {'A': 'Financials', 'B': 'Financials', 'C': 'Energy & Utilities'},
+        )
+        assert len(result) == 1
+        assert result.iloc[0]['Sector'] == 'Energy & Utilities'
+
+    def test_single_sector_concentration_exceeds_max_sector_cap(self):
+        # A single-sector-heavy actual portfolio must be detectable against the same
+        # MAX_SECTOR_CAP the optimizer enforces going forward on new allocations -- this is
+        # the separate check on what price drift has already done to existing holdings.
+        result = compute_sector_composition(
+            {'A': 900000.0, 'B': 100000.0},
+            {'A': 'Financials', 'B': 'Energy & Utilities'},
+        )
+        top_sector_pct = result.iloc[0]['Pct']
+        assert top_sector_pct > MAX_SECTOR_CAP
+
+    def test_pct_sums_to_one_across_all_sectors(self):
+        result = compute_sector_composition(
+            {'A': 123456.0, 'B': 78901.0, 'C': 55555.0, 'D': 11111.0},
+            {'A': 'Financials', 'B': 'Information Technology', 'C': 'Energy & Utilities', 'D': 'Financials'},
+        )
+        assert result['Pct'].sum() == pytest.approx(1.0, abs=1e-9)
 
 
 def _fundamentals_df(rows):

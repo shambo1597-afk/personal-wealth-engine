@@ -17,7 +17,7 @@ from scipy.optimize import minimize
 from sklearn.covariance import LedoitWolf
 
 from config import (
-    DB_FILE, RISK_FREE_RATE, MAX_RETAIL_CAP, MIN_DISPOSAL_VALUE,
+    DB_FILE, RISK_FREE_RATE, MAX_RETAIL_CAP, MAX_SECTOR_CAP, MIN_DISPOSAL_VALUE,
     TOP_N_SELECTED_EQUITIES,
     EQUITY_DELIVERY_FRICTION, ETF_DEBT_GOLD_FRICTION,
     SOVEREIGN_BOND_TICKER, get_market_time_horizons
@@ -42,7 +42,7 @@ from quant_engine import (
     compute_historical_var, compute_parametric_var, compute_cvar, MIN_OBSERVATIONS_FOR_RISK_METRICS,
     compute_monte_carlo_wealth_projection,
     run_portfolio_stress_test, STRESS_TEST_SCENARIOS,
-    compute_inverse_herfindahl_index, compute_core_satellite_split,
+    compute_inverse_herfindahl_index, compute_core_satellite_split, compute_sector_composition,
     compute_growth_quality_quadrant,
     QUADRANT_HIGH_GROWTH_HIGH_RETURNS, QUADRANT_HIGH_GROWTH_LOW_RETURNS,
     QUADRANT_LOW_GROWTH_HIGH_RETURNS, QUADRANT_LOW_GROWTH_LOW_RETURNS, QUADRANT_INSUFFICIENT_DATA,
@@ -2227,6 +2227,60 @@ with tab_risk_lab:
     st.caption(
         "Tag holdings 'core' or 'satellite' in the 📋 Actionable Demat Ticket tab's Core / "
         "Satellite Position Tagging panel. Untagged positions default to 'core'."
+    )
+
+    st.markdown("---")
+
+    # --- 1C. SECTOR COMPOSITION (ACTUAL CURRENT HOLDINGS) ---
+    st.markdown("#### 🏭 Sector Composition (Actual Current Holdings)")
+    sector_comp_df = compute_sector_composition(actual_holdings_values, live_sector_map)
+    if sector_comp_df.empty:
+        st.info("No current holdings to break down by sector yet.")
+    else:
+        sec_chart_col, sec_table_col = st.columns([1, 1])
+        with sec_chart_col:
+            fig_sector = px.pie(
+                sector_comp_df,
+                values='Value',
+                names='Sector',
+                title="Actual Sector Allocation",
+                hole=0.4,
+            )
+            fig_sector.update_traces(textposition='inside', textinfo='percent+label')
+            fig_sector.update_layout(height=450, margin=dict(l=20, r=20, t=40, b=20), showlegend=False)
+            st.plotly_chart(fig_sector, width="stretch")
+        with sec_table_col:
+            sector_display_df = sector_comp_df.copy()
+            sector_display_df['Pct'] = sector_display_df['Pct'] * 100.0
+            sector_display_df = sector_display_df.rename(columns={'Pct': 'Pct (%)', 'Position_Count': 'Positions'})
+            st.dataframe(
+                sector_display_df,
+                column_config={
+                    'Sector': st.column_config.TextColumn('Sector', width="medium"),
+                    'Value': st.column_config.NumberColumn('Value (₹)', format='₹%.0f', width="small"),
+                    'Pct (%)': st.column_config.NumberColumn('Pct (%)', format='%.1f%%', width="small"),
+                    'Positions': st.column_config.NumberColumn('Positions', width="small"),
+                },
+                hide_index=True,
+                width="stretch",
+            )
+
+        over_cap_sectors = sector_comp_df[sector_comp_df['Pct'] > MAX_SECTOR_CAP]
+        if not over_cap_sectors.empty:
+            over_cap_list = ", ".join(
+                f"{row['Sector']} ({row['Pct']*100:.1f}%)" for _, row in over_cap_sectors.iterrows()
+            )
+            st.warning(
+                f"⚠️ **Sector concentration on actual holdings:** {over_cap_list} exceed"
+                f"{'s' if len(over_cap_sectors) == 1 else ''} the {MAX_SECTOR_CAP*100:.0f}% sector cap. "
+                "This is a DIFFERENT check from the optimizer's own enforcement -- the optimizer only "
+                "constrains NEW allocations going forward, so actual holdings can already exceed the cap "
+                "through price drift even if every past rebalance respected it at the time. Consider "
+                "trimming the concentrated sector."
+            )
+    st.caption(
+        "Computed from your ACTUAL current holdings at live prices, grouped by the same sector "
+        "classification the optimizer uses to enforce the sector cap on new allocations."
     )
 
     st.markdown("---")

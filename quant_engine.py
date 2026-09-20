@@ -3319,6 +3319,60 @@ def compute_core_satellite_split(
         'satellite_count': satellite_count,
     }
 
+
+def compute_sector_composition(
+    actual_holdings_values: Dict[str, float],
+    sector_map: Dict[str, str],
+) -> pd.DataFrame:
+    """
+    Computes the ACTUAL current sector composition of a portfolio, by value and position count
+    -- what is really held right now at today's prices, sourced the same way
+    compute_core_satellite_split sources its input (actual_holdings_values from owned_summary x
+    latest_prices_series), never from the optimizer's target/proposed weights. The optimizer
+    enforces MAX_SECTOR_CAP going forward on new allocations; this is the separate, independent
+    check on what price drift has already done to the sectors actually held.
+    A ticker not present in `sector_map` is grouped under 'Other' rather than raised or dropped
+    -- this is a deliberately simpler lookup than get_asset_sector's keyword-heuristic fallback,
+    since an unmapped ticker here should be visibly flagged as unclassified, not silently
+    guessed at.
+    Returns a DataFrame with columns ['Sector', 'Value', 'Pct', 'Position_Count'], sorted by
+    Value descending. 'Pct' is each sector's share of total held value on a 0.0-1.0 scale --
+    matching compute_core_satellite_split's core_pct/satellite_pct convention, not a 0-100
+    scale, so sibling "actual holdings" metrics stay on one consistent scale for callers.
+    Empty or all-zero/negative `actual_holdings_values` returns an empty DataFrame with the
+    correct columns, not an error.
+    """
+    columns = ['Sector', 'Value', 'Pct', 'Position_Count']
+    sector_values: Dict[str, float] = {}
+    sector_counts: Dict[str, int] = {}
+
+    for ticker, value in (actual_holdings_values or {}).items():
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(v) or v <= 0.0:
+            continue
+        sector = (sector_map or {}).get(ticker, 'Other')
+        sector_values[sector] = sector_values.get(sector, 0.0) + v
+        sector_counts[sector] = sector_counts.get(sector, 0) + 1
+
+    if not sector_values:
+        return pd.DataFrame(columns=columns)
+
+    total_value = sum(sector_values.values())
+    rows = [
+        {
+            'Sector': sector,
+            'Value': value,
+            'Pct': (value / total_value) if total_value > 0.0 else 0.0,
+            'Position_Count': sector_counts[sector],
+        }
+        for sector, value in sector_values.items()
+    ]
+    result = pd.DataFrame(rows, columns=columns).sort_values('Value', ascending=False).reset_index(drop=True)
+    return result
+
 # ----------------------------------------------------------------------------------------------------
 # 9. FORWARD-LOOKING MONTE CARLO WEALTH PROJECTION ENGINE
 # ----------------------------------------------------------------------------------------------------
