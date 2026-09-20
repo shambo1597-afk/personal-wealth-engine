@@ -1316,6 +1316,22 @@ def fetch_yfinance_fundamentals(ticker: str) -> Optional[Dict[str, Any]]:
     (falls through to the unaudited local estimate) rather than silently
     computing wrong numbers from zeros.
 
+    Also derives ROCE (Return on Capital Employed) and one-year earnings growth from the SAME
+    already-fetched statement DataFrames -- no new external data dependency:
+      ROCE (%) = EBIT / (Total Assets - Current Liabilities) * 100
+      Earnings Growth (%) = (Net Income_latest - Net Income_prior) / abs(Net Income_prior) * 100
+    'EBIT' is a standard yfinance income_stmt row for most non-financial companies (falls back
+    to 'Operating Income' then 'Pretax Income' if absent) -- UNLIKE the fields above, this has
+    NOT been verified against a live response in this environment (no network access to Yahoo
+    Finance here to re-run scripts/verify_yfinance_fundamentals.py against it), so treat
+    roce_num with more caution than roe_num until someone with network access confirms the row
+    label against a real response. 'Current Liabilities' (needed for Capital Employed) was
+    already confirmed absent for the bank in the sample above, so ROCE naturally comes back None
+    for financial institutions too -- consistent with ROCE not being a meaningful metric for
+    banks in the first place (same reasoning as the existing F-Score exemption). Both new fields
+    return None rather than a fabricated number when the required rows aren't available, same
+    philosophy as everything else in this function.
+
     Returns None if yfinance has no usable statements for this ticker (falls
     through to the unaudited local estimate), never a partially-fabricated row.
     """
@@ -1366,6 +1382,14 @@ def fetch_yfinance_fundamentals(ticker: str) -> Optional[Dict[str, Any]]:
         curr_assets = _row(bs, ['Current Assets'], latest)
         curr_liab = _row(bs, ['Current Liabilities'], latest)
         shares = _row(inc, ['Basic Average Shares'], latest)
+        ebit = _row(inc, ['EBIT', 'Operating Income', 'Pretax Income'], latest)
+
+        capital_employed = (assets - curr_liab) if curr_liab is not None else None
+        roce = (
+            (ebit / capital_employed * 100.0)
+            if ebit is not None and capital_employed is not None and capital_employed > 0
+            else None
+        )
 
         # Genuine year-over-year criteria -- fail closed (no free point) when
         # the prior year or a required row isn't available, same philosophy
@@ -1376,6 +1400,7 @@ def fetch_yfinance_fundamentals(ticker: str) -> Optional[Dict[str, Any]]:
         liquidity_improved = False
         no_dilution = False
         margin_improved = False
+        net_inc_prev = None
         if prior:
             net_inc_prev = _row(inc, ['Net Income', 'Net Income Common Stockholders'], prior)
             rev_prev = _row(inc, ['Total Revenue', 'Operating Revenue'], prior)
@@ -1421,6 +1446,12 @@ def fetch_yfinance_fundamentals(ticker: str) -> Optional[Dict[str, Any]]:
         f_display = f"{f_score}/9 ★" if f_score >= 8 else f"{f_score}/9"
         now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).strftime('%Y-%m-%d %H:%M:%S UTC')
 
+        earnings_growth = (
+            (net_inc - net_inc_prev) / abs(net_inc_prev) * 100.0
+            if net_inc_prev is not None and abs(net_inc_prev) > 1e-9
+            else None
+        )
+
         pe_val = None
         try:
             info = t.info or {}
@@ -1445,6 +1476,7 @@ def fetch_yfinance_fundamentals(ticker: str) -> Optional[Dict[str, Any]]:
             'f_score_label': f_badge, 'f_score_display': f_display,
             'roe_num': roe, 'de_num': de, 'npm_num': npm,
             'turnover_num': turnover, 'leverage_num': leverage, 'pe_num': pe_val if pe_val is not None else 0.0,
+            'roce_num': roce, 'earnings_growth_num': earnings_growth,
             'piotroski_criteria_available': 9 if prior else 3,
             'piotroski_note': None if prior else 'Six of nine criteria need a prior year and default to failing -- only one year of statements was available.'
         }
@@ -1950,6 +1982,88 @@ def compute_institutional_accumulation_factor(
         accum_badges[col] = badge
 
     return pd.Series(accum_ratios), pd.Series(accum_badges)
+
+# ----------------------------------------------------------------------------------------------------
+# 3B. ROCE x EARNINGS GROWTH QUADRANT SCREEN
+# ----------------------------------------------------------------------------------------------------
+QUADRANT_HIGH_GROWTH_HIGH_RETURNS = 'High Growth + High Returns'
+QUADRANT_HIGH_GROWTH_LOW_RETURNS = 'High Growth + Low Returns'
+QUADRANT_LOW_GROWTH_HIGH_RETURNS = 'Low Growth + High Returns'
+QUADRANT_LOW_GROWTH_LOW_RETURNS = 'Low Growth + Low Returns'
+QUADRANT_INSUFFICIENT_DATA = 'Insufficient Data'
+
+
+def compute_growth_quality_quadrant(fundamentals_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Classifies each ticker into one of four ROCE x Earnings Growth quadrants, split on the
+    MEDIAN of the current investable universe (not a fixed hardcoded threshold) -- "high" ROCE
+    or "high" growth is relative to what the rest of the universe is doing right now, not an
+    absolute cutoff that would drift stale as the universe or the macro cycle changes:
+        - 'High Growth + High Returns': both metrics >= their universe median (the priority
+          quadrant -- compounding growth funded by genuinely capital-efficient operations).
+        - 'High Growth + Low Returns': growing, but the growth isn't (yet) capital-efficient.
+        - 'Low Growth + High Returns': capital-efficient but not growing -- a dividend-focused
+          profile, not a compounder.
+        - 'Low Growth + Low Returns': neither.
+        - 'Insufficient Data': ROCE or earnings growth (or both) is missing/NaN for this ticker
+          -- excluded from quadrants entirely rather than defaulted into one on an incomplete
+          read, and excluded from the median calculation itself so a handful of data-poor
+          tickers can't skew the threshold for everyone else.
+    Uses 'roce_num' (Return on Capital Employed, see fetch_yfinance_fundamentals) rather than
+    'roe_num' (DuPont ROE) as the returns axis -- ROCE is capital-structure-neutral (unaffected
+    by financial leverage the way ROE is), which is the more honest "quality" signal for this
+    kind of screen. In practice this means only tickers whose fundamentals came from the real
+    audited Yahoo Finance path (fetch_yfinance_fundamentals) will have a computable quadrant
+    right now -- the EODHD and unaudited-estimate fallback paths don't populate 'roce_num' or
+    'earnings_growth_num' (deliberately: this screen exists to narrow attention to real signal,
+    and mixing in a fabricated ROCE number would defeat the entire point). Tickers on those
+    other paths simply show up as 'Insufficient Data' here until a real sync populates them.
+    Growth is one-year (latest vs. prior fiscal year) net income growth, the only horizon
+    'earnings_growth_num' currently carries -- see fetch_yfinance_fundamentals for the formula.
+
+    Returns a DataFrame with columns ['Ticker', 'roce_num', 'earnings_growth_num', 'Quadrant'].
+    Empty in, empty (but correctly-columned) out. This is a screen to narrow attention, not a
+    recommendation -- deliberately carries no buy/conviction label on top of the quadrant.
+    """
+    columns = ['Ticker', 'roce_num', 'earnings_growth_num', 'Quadrant']
+    if fundamentals_df is None or fundamentals_df.empty or 'Ticker' not in fundamentals_df.columns:
+        return pd.DataFrame(columns=columns)
+
+    roce = pd.to_numeric(fundamentals_df.get('roce_num'), errors='coerce') if 'roce_num' in fundamentals_df.columns else pd.Series(np.nan, index=fundamentals_df.index)
+    growth = pd.to_numeric(fundamentals_df.get('earnings_growth_num'), errors='coerce') if 'earnings_growth_num' in fundamentals_df.columns else pd.Series(np.nan, index=fundamentals_df.index)
+
+    valid_mask = roce.notna() & growth.notna()
+
+    result = pd.DataFrame({
+        'Ticker': fundamentals_df['Ticker'].values,
+        'roce_num': roce.values,
+        'earnings_growth_num': growth.values,
+    })
+
+    if not valid_mask.any():
+        result['Quadrant'] = QUADRANT_INSUFFICIENT_DATA
+        return result[columns]
+
+    roce_median = float(roce[valid_mask].median())
+    growth_median = float(growth[valid_mask].median())
+
+    def _classify(is_valid, roce_val, growth_val):
+        if not is_valid:
+            return QUADRANT_INSUFFICIENT_DATA
+        high_returns = roce_val >= roce_median
+        high_growth = growth_val >= growth_median
+        if high_growth and high_returns:
+            return QUADRANT_HIGH_GROWTH_HIGH_RETURNS
+        if high_growth and not high_returns:
+            return QUADRANT_HIGH_GROWTH_LOW_RETURNS
+        if not high_growth and high_returns:
+            return QUADRANT_LOW_GROWTH_HIGH_RETURNS
+        return QUADRANT_LOW_GROWTH_LOW_RETURNS
+
+    result['Quadrant'] = [
+        _classify(valid_mask.iloc[i], roce.iloc[i], growth.iloc[i]) for i in range(len(result))
+    ]
+    return result[columns]
 
 RED_FLAG_KEYWORDS = ['fraud', 'probe', 'sebi', 'raid', 'cbi', 'ed', 'default', 'resigns', 'scandal', 'penalty', 'downgrade']
 BULLISH_KEYWORDS = ['profit rises', 'record revenue', 'order win', 'bonus', 'dividend', 'upgrade', 'expansion', 'beats estimate']
@@ -3143,6 +3257,67 @@ def compute_inverse_herfindahl_index(weights: Union[Dict[str, float], pd.Series]
     if hhi <= 1e-12:
         return None
     return float(1.0 / hhi)
+
+
+def compute_core_satellite_split(
+    actual_holdings_values: Dict[str, float],
+    classifications: Dict[str, str],
+) -> Dict[str, float]:
+    """
+    Computes the ACTUAL current core/satellite split of a portfolio, by value and by position
+    count -- what is really held right now at today's prices, never a target allocation (the
+    70/30 target this is compared against lives in the caller, as a drift check).
+    Edge cases handled explicitly rather than left to fall out of the arithmetic:
+      - A ticker present in `classifications` but with a zero, missing, or non-positive current
+        value contributes to neither the value split nor the position counts -- there's nothing
+        held to classify.
+      - A ticker with a positive current value but no entry in `classifications` is treated as
+        'core', matching database.DEFAULT_POSITION_CLASSIFICATION -- an untagged holding is
+        never silently dropped from the split, it just lands on the conservative side until the
+        user tags it (same default the database layer itself uses).
+      - Any classification string other than exactly 'satellite' is treated as 'core' here too
+        (defense in depth -- database.set_position_classification already rejects anything
+        outside {'core', 'satellite'} at write time, so this should never actually fire).
+    Returns:
+        {
+            'core_value': float, 'satellite_value': float,       # INR
+            'core_pct': float, 'satellite_pct': float,           # of total held value, 0.0-1.0
+            'core_count': int, 'satellite_count': int,           # number of positions
+        }
+    All-zero if `actual_holdings_values` is empty or nets to zero total value.
+    """
+    core_value = 0.0
+    satellite_value = 0.0
+    core_count = 0
+    satellite_count = 0
+
+    for ticker, value in (actual_holdings_values or {}).items():
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(v) or v <= 0.0:
+            continue
+        classification = classifications.get(ticker, 'core') if classifications else 'core'
+        if classification == 'satellite':
+            satellite_value += v
+            satellite_count += 1
+        else:
+            core_value += v
+            core_count += 1
+
+    total_value = core_value + satellite_value
+    core_pct = (core_value / total_value) if total_value > 0.0 else 0.0
+    satellite_pct = (satellite_value / total_value) if total_value > 0.0 else 0.0
+
+    return {
+        'core_value': core_value,
+        'satellite_value': satellite_value,
+        'core_pct': core_pct,
+        'satellite_pct': satellite_pct,
+        'core_count': core_count,
+        'satellite_count': satellite_count,
+    }
 
 # ----------------------------------------------------------------------------------------------------
 # 9. FORWARD-LOOKING MONTE CARLO WEALTH PROJECTION ENGINE

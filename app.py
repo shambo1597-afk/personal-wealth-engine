@@ -25,7 +25,8 @@ from config import (
 from database import (
     get_db_connection, init_db, clean_tax_lots_df, clean_trade_ledger_df,
     reconcile_corporate_actions_and_splits, parse_and_import_broker_csv, compile_xirr_cash_flows,
-    backup_database, sync_kite_holdings_to_tax_lots
+    backup_database, sync_kite_holdings_to_tax_lots,
+    get_position_classification, set_position_classification, VALID_POSITION_CLASSIFICATIONS
 )
 from quant_engine import (
     compute_portfolio_xirr, fetch_master_market_data, solve_portfolio_in_memory,
@@ -41,7 +42,10 @@ from quant_engine import (
     compute_historical_var, compute_parametric_var, compute_cvar, MIN_OBSERVATIONS_FOR_RISK_METRICS,
     compute_monte_carlo_wealth_projection,
     run_portfolio_stress_test, STRESS_TEST_SCENARIOS,
-    compute_inverse_herfindahl_index,
+    compute_inverse_herfindahl_index, compute_core_satellite_split,
+    compute_growth_quality_quadrant,
+    QUADRANT_HIGH_GROWTH_HIGH_RETURNS, QUADRANT_HIGH_GROWTH_LOW_RETURNS,
+    QUADRANT_LOW_GROWTH_HIGH_RETURNS, QUADRANT_LOW_GROWTH_LOW_RETURNS, QUADRANT_INSUFFICIENT_DATA,
 )
 from tax_engine import (
     compute_realized_tax_summary, compute_unrealized_tax_lots_analysis, build_schedule_112a_records,
@@ -428,6 +432,10 @@ for t in tax_lots_df['ticker'].unique():
     }
 
 owned_tickers = list(owned_summary.keys())
+# Core/satellite tags for every currently-held ticker -- untagged positions default to 'core'
+# (see get_position_classification's docstring). Loaded once here so both the tagging editor
+# (Tab 1) and the core/satellite split metrics (Risk & Planning Lab tab) read the same snapshot.
+position_classifications = {t: get_position_classification(t) for t in owned_tickers}
 all_relevant_tickers = list(set(tickers + owned_tickers + [SOVEREIGN_BOND_TICKER]))
 latest_prices_series = fetch_latest_prices(all_relevant_tickers, turbo_mode=turbo_mode)
 if kite_client:
@@ -1110,6 +1118,46 @@ with tab_ticket:
         'Current Value (₹)': '₹{:,.2f}',
         'Target Value (₹)': '₹{:,.2f}'
     }), width="stretch")
+
+    with st.expander("🎯 Core / Satellite Position Tagging", expanded=False):
+        st.caption(
+            "Tag each current holding 'core' (long-term conviction anchor, ~70% target) or "
+            "'satellite' (tactical/smaller-conviction sleeve, ~30% target) -- untagged positions "
+            "default to 'core'. Changes save immediately and feed the core/satellite split shown "
+            "in the 🎯 Risk & Planning Lab tab."
+        )
+        classification_rows = []
+        for t in owned_tickers:
+            price = float(latest_prices_series.get(t, 0.0))
+            if pd.isna(price) or price < 0:
+                price = 0.0
+            classification_rows.append({
+                'Ticker': t,
+                'Asset': owned_summary[t]['asset_name'],
+                'Current Value (₹)': owned_summary[t]['total_shares'] * price,
+                'Classification': position_classifications[t],
+            })
+        if not classification_rows:
+            st.info("No current holdings to classify yet.")
+        else:
+            classification_df = pd.DataFrame(classification_rows).set_index('Ticker')
+            edited_classification_df = st.data_editor(
+                classification_df,
+                column_config={
+                    'Current Value (₹)': st.column_config.NumberColumn('Current Value (₹)', format='₹%.2f'),
+                    'Classification': st.column_config.SelectboxColumn(
+                        'Core / Satellite', options=sorted(VALID_POSITION_CLASSIFICATIONS), required=True
+                    ),
+                },
+                disabled=['Asset', 'Current Value (₹)'],
+                width="stretch",
+                key="core_satellite_editor",
+            )
+            for t in edited_classification_df.index:
+                new_classification = edited_classification_df.loc[t, 'Classification']
+                if new_classification != position_classifications.get(t):
+                    set_position_classification(t, new_classification)
+                    position_classifications[t] = new_classification
 
     with st.expander('📰 Live News & Catalyst Monitor', expanded=False):
         st.caption("Review recent news headlines and corporate catalysts for your selected portfolio constituents prior to placing orders.")
@@ -1884,6 +1932,71 @@ with tab_dupont:
             width="stretch"
         )
 
+    st.markdown("---")
+
+    # -------------------------------------------------------------------------
+    # 5. ROCE x EARNINGS GROWTH QUADRANT SCREEN
+    # -------------------------------------------------------------------------
+    st.markdown("#### 4. 🎯 ROCE x Earnings Growth Quadrant Screen")
+    st.caption(
+        "Classifies each ticker into one of four quadrants by whether ROCE (Return on Capital "
+        "Employed) and one-year earnings growth are each above or below the CURRENT universe's "
+        "median -- 'high' is relative to today's universe, not a fixed cutoff. Only tickers "
+        "synced via the real audited Yahoo Finance path have a computable ROCE/growth right now "
+        "-- everything else shows as 'Insufficient Data' rather than being ranked on unverified "
+        "numbers. This is a screen to narrow attention, not a recommendation."
+    )
+    quadrant_df = compute_growth_quality_quadrant(
+        universe_fundamentals if universe_fundamentals is not None else pd.DataFrame()
+    )
+    if quadrant_df.empty:
+        st.info("No fundamentals synced yet -- sync audited structured financials above to populate this screen.")
+    else:
+        quad_order = [
+            QUADRANT_HIGH_GROWTH_HIGH_RETURNS, QUADRANT_HIGH_GROWTH_LOW_RETURNS,
+            QUADRANT_LOW_GROWTH_HIGH_RETURNS, QUADRANT_LOW_GROWTH_LOW_RETURNS,
+            QUADRANT_INSUFFICIENT_DATA,
+        ]
+        quadrant_counts = quadrant_df['Quadrant'].value_counts()
+        quad_cols = st.columns(5)
+        for quad_col, quad_label in zip(quad_cols, quad_order):
+            with quad_col:
+                st.metric(quad_label, int(quadrant_counts.get(quad_label, 0)))
+
+        quadrant_filter = st.selectbox(
+            "Filter to quadrant:",
+            options=["All Four Quadrants"] + quad_order,
+            index=1,  # defaults to the priority quadrant
+            key="quadrant_filter_select",
+        )
+        filtered_quadrant_df = (
+            quadrant_df if quadrant_filter == "All Four Quadrants"
+            else quadrant_df[quadrant_df['Quadrant'] == quadrant_filter]
+        )
+
+        asset_lookup = (
+            multifactor_scorecard_df.set_index('Ticker')['Asset'].to_dict()
+            if not multifactor_scorecard_df.empty and 'Ticker' in multifactor_scorecard_df.columns else {}
+        )
+        filtered_quadrant_display = filtered_quadrant_df.copy()
+        filtered_quadrant_display['Asset'] = filtered_quadrant_display['Ticker'].map(
+            lambda t: asset_lookup.get(t, str(t).replace('.NS', ''))
+        )
+        filtered_quadrant_display = filtered_quadrant_display[['Asset', 'Ticker', 'roce_num', 'earnings_growth_num', 'Quadrant']]
+
+        st.dataframe(
+            filtered_quadrant_display,
+            column_config={
+                'Asset': st.column_config.TextColumn('Asset', width="medium"),
+                'Ticker': st.column_config.TextColumn('Ticker', width="small"),
+                'roce_num': st.column_config.NumberColumn('ROCE', format="%.1f%%", width="small"),
+                'earnings_growth_num': st.column_config.NumberColumn('Earnings Growth (YoY)', format="%+.1f%%", width="small"),
+                'Quadrant': st.column_config.TextColumn('Quadrant', width="medium"),
+            },
+            hide_index=True,
+            width="stretch",
+        )
+
 # --- TAB 4: TAX HARVESTING & CAPITAL GAINS CENTER ---
 with tab_harvest:
     st.subheader("💎 Annual Tax-Harvesting & Capital Gains Center (Section 112A / 111A / 50AA & Budget 2024–2026)")
@@ -2048,18 +2161,72 @@ with tab_risk_lab:
     actual_holding_count = len(actual_holdings_values)
     inv_hhi_val = compute_inverse_herfindahl_index(actual_holdings_values)
 
-    dc_col1, dc_col2 = st.columns(2)
+    # Core-only / satellite-only views -- compute_inverse_herfindahl_index stays a pure
+    # weights-in function; filtering actual_holdings_values by tag is the caller's job.
+    core_holdings_values = {
+        t: v for t, v in actual_holdings_values.items()
+        if position_classifications.get(t, 'core') != 'satellite'
+    }
+    satellite_holdings_values = {
+        t: v for t, v in actual_holdings_values.items()
+        if position_classifications.get(t, 'core') == 'satellite'
+    }
+    inv_hhi_core_val = compute_inverse_herfindahl_index(core_holdings_values)
+    inv_hhi_satellite_val = compute_inverse_herfindahl_index(satellite_holdings_values)
+
+    dc_col1, dc_col2, dc_col3, dc_col4 = st.columns(4)
     with dc_col1:
         st.metric("Positions Held (Actual)", f"{actual_holding_count}")
     with dc_col2:
         if inv_hhi_val is not None:
-            st.metric("Effective Diversification", f"~{inv_hhi_val:.1f} stocks", f"Inverse HHI = {inv_hhi_val:.2f}")
+            st.metric("Effective Diversification (Whole)", f"~{inv_hhi_val:.1f} stocks", f"Inverse HHI = {inv_hhi_val:.2f}")
         else:
-            st.metric("Effective Diversification", "N/A", "No current holdings")
+            st.metric("Effective Diversification (Whole)", "N/A", "No current holdings")
+    with dc_col3:
+        if inv_hhi_core_val is not None:
+            st.metric("Effective Diversification (Core)", f"~{inv_hhi_core_val:.1f} stocks", f"Inverse HHI = {inv_hhi_core_val:.2f}")
+        else:
+            st.metric("Effective Diversification (Core)", "N/A", "No core holdings")
+    with dc_col4:
+        if inv_hhi_satellite_val is not None:
+            st.metric("Effective Diversification (Satellite)", f"~{inv_hhi_satellite_val:.1f} stocks", f"Inverse HHI = {inv_hhi_satellite_val:.2f}")
+        else:
+            st.metric("Effective Diversification (Satellite)", "N/A", "No satellite holdings")
     st.caption(
         "Effective diversification is computed from your ACTUAL current holdings at live prices "
         "(not the optimizer's target weights) -- the gap between it and 'Positions Held' shows "
-        "how much of your nominal position count is really just concentration in a few names."
+        "how much of your nominal position count is really just concentration in a few names. "
+        "Core/satellite views filter the same holdings by the tags set in the 📋 Actionable "
+        "Demat Ticket tab's Core / Satellite Position Tagging panel."
+    )
+
+    st.markdown("---")
+
+    # --- 1B. CORE / SATELLITE ACTUAL SPLIT (vs. the documented ~70/30 target) ---
+    st.markdown("#### 🎯 Core / Satellite Split (Actual Current Holdings)")
+    cs_split = compute_core_satellite_split(actual_holdings_values, position_classifications)
+
+    cs_col1, cs_col2, cs_col3, cs_col4 = st.columns(4)
+    with cs_col1:
+        st.metric("Core Value", f"₹{cs_split['core_value']:,.0f}", f"{cs_split['core_count']} positions")
+    with cs_col2:
+        st.metric("Satellite Value", f"₹{cs_split['satellite_value']:,.0f}", f"{cs_split['satellite_count']} positions")
+    with cs_col3:
+        st.metric("Core %", f"{cs_split['core_pct']*100:.1f}%")
+    with cs_col4:
+        st.metric("Satellite %", f"{cs_split['satellite_pct']*100:.1f}%")
+
+    if actual_holding_count > 0 and (cs_split['satellite_pct'] > 0.35 or cs_split['core_pct'] < 0.65):
+        st.warning(
+            f"⚠️ **Core/satellite drift:** Satellite is {cs_split['satellite_pct']*100:.1f}% of "
+            f"current holdings (target ~30%, soft ceiling 35%) and Core is "
+            f"{cs_split['core_pct']*100:.1f}% (target ~70%, soft floor 65%). This is a drift "
+            "nudge, not a block -- consider trimming satellite positions, or re-tagging any that "
+            "have become long-term conviction holds, back toward the 70/30 anchor."
+        )
+    st.caption(
+        "Tag holdings 'core' or 'satellite' in the 📋 Actionable Demat Ticket tab's Core / "
+        "Satellite Position Tagging panel. Untagged positions default to 'core'."
     )
 
     st.markdown("---")
