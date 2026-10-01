@@ -43,7 +43,7 @@ peewee==4.4.0
 pillow==12.3.0
 platformdirs==4.11.5
 plotly==6.9.0
-protobuf==7.36.0
+protobuf==7.36.2
 pyarrow==25.0.1
 pycparser==3.0
 pydeck==0.9.3
